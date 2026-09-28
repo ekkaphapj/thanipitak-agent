@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.log
+ComfyUI/
+models/
+output/
+input/draw_refs/
+*.safetensors
+*.gguf
+*.ckpt

@@ -1,0 +1,19 @@
+[Unit]
+Description=Local AI image generation web UI
+After=network.target comfyui.service
+Wants=comfyui.service
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/thanipitak-agent
+Environment=COMFY_HOME=%h/ComfyUI
+Environment=COMFY_URL=http://127.0.0.1:8188
+Environment=DRAW_HOST=127.0.0.1
+Environment=DRAW_PORT=8190
+ExecStart=/usr/bin/python3 %h/thanipitak-agent/draw_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
