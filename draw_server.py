@@ -141,6 +141,28 @@ def comfy_get(path):
         return json.loads(r.read().decode())
 
 
+def comfy_jobs_ahead(prompt_id):
+    """How many ComfyUI jobs finish before this one; None when unknown."""
+    try:
+        data = comfy_get("/queue")
+    except Exception:
+        return None
+
+    def ids(entries):
+        out = []
+        for e in entries if isinstance(entries, list) else []:
+            out.append(e[1] if isinstance(e, list) and len(e) > 1 else e)
+        return out
+
+    running = ids(data.get("queue_running"))
+    pending = ids(data.get("queue_pending"))
+    if prompt_id in pending:
+        return len([i for i in running if i != prompt_id]) + pending.index(prompt_id)
+    if prompt_id in running:
+        return 0
+    return None
+
+
 def save_reference(data_url, job_id):
     """Persist an uploaded reference image (data URL) into ComfyUI's input dir.
 
@@ -279,6 +301,7 @@ def run_job(job_id, spec, ref_path=None):
             with LOCK:
                 JOBS[job_id]["prompt_id"] = pid
                 JOBS[job_id]["status"] = "running"
+                JOBS[job_id]["started"] = time.time()
             deadline = time.time() + JOB_TIMEOUT
             while time.time() < deadline:
                 time.sleep(2)
@@ -298,6 +321,7 @@ def run_job(job_id, spec, ref_path=None):
                                 with LOCK:
                                     JOBS[job_id]["file"] = img["filename"]
                                     JOBS[job_id]["status"] = "done"
+                                    JOBS[job_id]["finished"] = time.time()
                                 return
                     raise RuntimeError("finished but no output image found")
             raise RuntimeError("timeout waiting for ComfyUI")
@@ -342,6 +366,10 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 job = dict(JOBS.get(jid, {}))
             job.setdefault("status", "unknown")
+            if job.get("status") in ("queued", "running") and job.get("prompt_id"):
+                ahead = comfy_jobs_ahead(job["prompt_id"])
+                if ahead is not None:
+                    job["queue_ahead"] = ahead
             self._send(200, job)
         elif self.path.startswith("/api/image/"):
             jid = self.path.rsplit("/", 1)[-1]

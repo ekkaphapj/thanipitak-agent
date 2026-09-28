@@ -198,10 +198,13 @@ async function generate(event){
       await new Promise(resolve=>setTimeout(resolve,3000));
       const state=await jsonResponse(await fetch("/api/status/"+encodeURIComponent(job.id)));
       if(state.stage==="translating")setStatus("กำลังแปลคำบรรยายภาษาไทยเป็นภาษาอังกฤษ…");
+      else if(state.queue_ahead>0)setStatus("กำลังรอคิว… มีงานก่อนหน้าอีก "+state.queue_ahead+" งาน");
+      else if(state.status==="running")setStatus("กำลังสร้างภาพ…");
       if(state.status==="done"){
         const imageUrl="/api/image/"+encodeURIComponent(job.id);
         $("result").src=imageUrl;$("download").href=imageUrl;$("download").style.display="inline-block";show("result");
-        setStatus("สร้างภาพเสร็จแล้ว · ใช้เวลา "+Math.round((Date.now()-startedAt)/1000)+" วินาที");break
+        const secs=state.finished&&state.ts?Math.round(state.finished-state.ts):Math.round((Date.now()-startedAt)/1000);
+        setStatus("สร้างภาพเสร็จแล้ว · ใช้เวลา "+secs+" วินาที");break
       }
       if(state.status==="error")throw new Error(state.error||"สร้างภาพไม่สำเร็จ");
       if(state.status!=="queued"&&state.status!=="running")throw new Error("ไม่พบงานนี้ในระบบ กรุณาลองใหม่")

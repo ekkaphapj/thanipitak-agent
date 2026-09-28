@@ -2,6 +2,7 @@
 import json
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -104,6 +105,10 @@ class RunJobTest(unittest.TestCase):
             draw_server.run_job("job1", spec)
         self.assertEqual(draw_server.JOBS["job1"]["status"], "done")
         self.assertEqual(draw_server.JOBS["job1"]["file"], "out.png")
+        self.assertIn("started", draw_server.JOBS["job1"])
+        self.assertIn("finished", draw_server.JOBS["job1"])
+        self.assertGreaterEqual(draw_server.JOBS["job1"]["finished"],
+                                draw_server.JOBS["job1"]["started"])
         self.assertEqual(draw_server.JOBS["job1"]["prompt_enhanced"],
                          "an orange cat reading a book")
         self.assertEqual(self.graph["3"]["inputs"]["prompt"], "an orange cat reading a book")
@@ -120,6 +125,23 @@ class RunJobTest(unittest.TestCase):
             draw_server.run_job("job2", spec)
         self.assertEqual(draw_server.JOBS["job2"]["status"], "error")
         self.assertIn("comfy down", draw_server.JOBS["job2"]["error"])
+
+
+class QueuePositionTest(unittest.TestCase):
+    def test_counts_running_and_pending(self):
+        queue = {"queue_running": [[1, "a"]],
+                 "queue_pending": [[2, "b"], [3, "c"], [4, "a2"]]}
+        with mock.patch.object(draw_server, "comfy_get", return_value=queue):
+            self.assertEqual(draw_server.comfy_jobs_ahead("c"), 2)
+            self.assertEqual(draw_server.comfy_jobs_ahead("a"), 0)
+            self.assertIsNone(draw_server.comfy_jobs_ahead("zzz"))
+
+    def test_handles_string_entries_and_errors(self):
+        with mock.patch.object(draw_server, "comfy_get",
+                               return_value={"queue_running": ["x"], "queue_pending": ["x2"]}):
+            self.assertEqual(draw_server.comfy_jobs_ahead("x2"), 1)
+        with mock.patch.object(draw_server, "comfy_get", side_effect=OSError):
+            self.assertIsNone(draw_server.comfy_jobs_ahead("x"))
 
 
 class DrawHttpTest(unittest.TestCase):
@@ -195,6 +217,22 @@ class DrawHttpTest(unittest.TestCase):
                 self.post(json.dumps({"prompt": "bird", "model": draw_server.FLUX_MODEL_ID}).encode())
             self.assertEqual(error.exception.code, 503)
             error.exception.close()
+
+    def test_status_reports_comfy_queue_position(self):
+        draw_server.JOBS["jq"] = {"status": "running", "prompt_id": "p1", "ts": time.time()}
+        queue = {"queue_running": [[1, "other"]], "queue_pending": [[2, "p2"], [3, "p1"]]}
+        with mock.patch.object(draw_server, "comfy_get", return_value=queue):
+            with urllib.request.urlopen(self.base + "/api/status/jq") as response:
+                data = json.load(response)
+        self.assertEqual(data["queue_ahead"], 2)
+
+        draw_server.JOBS["jd"] = {"status": "done", "prompt_id": "p9", "ts": 1.0,
+                                  "started": 1.5, "finished": 2.0}
+        with mock.patch.object(draw_server, "comfy_get") as comfy_get:
+            with urllib.request.urlopen(self.base + "/api/status/jd") as response:
+                data = json.load(response)
+        comfy_get.assert_not_called()
+        self.assertNotIn("queue_ahead", data)
 
     def test_invalid_utf8_is_rejected(self):
         with self.assertRaises(urllib.error.HTTPError) as error:
