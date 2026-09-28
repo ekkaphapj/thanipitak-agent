@@ -92,6 +92,7 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
     <label for="prompt">คำบรรยายภาพ <span class="required" aria-hidden="true">*</span></label>
     <textarea id="prompt" name="prompt" required maxlength="4000" placeholder="เช่น แมวส้มใส่ชุดนักสืบนั่งอยู่บนหลังคายามค่ำ แสงโคมไฟสีอุ่น มองเห็นเมืองด้านหลัง"></textarea>
     <p class="hint">บอกตัวแบบ ตำแหน่งในภาพ ฉาก และแสงให้ชัด หากต้องการตัวหนังสือ ให้ใส่ข้อความในเครื่องหมายคำพูด</p>
+    <p class="hint" id="thai-hint" hidden>เขียนคำบรรยายเป็นภาษาไทยได้เลย ระบบจะแปลเป็นภาษาอังกฤษให้อัตโนมัติเพื่อให้ตรงใจโมเดลมากขึ้น ยกเว้นข้อความในเครื่องหมายคำพูด " " จะคงภาษาเดิมไว้ให้ปรากฏในภาพ</p>
     <div class="examples"><span class="examples-title">ลองเริ่มจากตัวอย่าง</span><div class="chips">
       <button class="chip" type="button" data-prompt="ทุ่งดอกไม้สีแดงยามเช้า แสงอาทิตย์อ่อน ๆ ภูเขาไกล ๆ ภาพถ่ายสมจริง">ทิวทัศน์ธรรมชาติ</button>
       <button class="chip" type="button" data-prompt="แมวส้มสวมชุดนักบินอวกาศยืนบนดวงจันทร์ มองเห็นโลกอยู่ด้านหลัง ภาพประกอบรายละเอียดสูง">ตัวละครแฟนตาซี</button>
@@ -107,9 +108,9 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
       <label class="size"><input type="radio" name="resolution" value="1024" checked><span><strong>1024 × 1024</strong><small>รายละเอียดสูง</small></span></label>
     </div></fieldset>
     <fieldset id="profile-fieldset"><legend>ความเร็วในการสร้าง</legend><div class="sizes">
-      <label class="size"><input type="radio" name="profile" value="fast"><span><strong>⚡ เร็ว</strong><small>~1-2 นาที ภาพทั่วไป</small></span></label>
-      <label class="size"><input type="radio" name="profile" value="medium" checked><span><strong>⚖️ ปานกลาง</strong><small>~2-3 นาที สมดุล</small></span></label>
-      <label class="size"><input type="radio" name="profile" value="quality"><span><strong>✧ เน้นคุณภาพ</strong><small>~4-5 นาที ตรง/ละเอียด</small></span></label>
+      <label class="size"><input type="radio" name="profile" value="fast"><span><strong>⚡ เร็ว</strong><small>~1 นาที ภาพทั่วไป</small></span></label>
+      <label class="size"><input type="radio" name="profile" value="medium" checked><span><strong>⚖️ ปานกลาง</strong><small>~1-2 นาที สมดุล</small></span></label>
+      <label class="size"><input type="radio" name="profile" value="quality"><span><strong>✧ เน้นคุณภาพ</strong><small>~2-3 นาที ตรง/ละเอียด</small></span></label>
     </div>
     <p class="hint">ยิ่งเน้นคุณภาพ ภาพยิ่งคมและตรงคำบรรยาย แต่ใช้เวลานานขึ้น</p></fieldset>
     <fieldset id="reference-fieldset"><legend>รูปอ้างอิงใบหน้า (ไม่บังคับ)</legend>
@@ -169,6 +170,7 @@ async function loadModels(){
     const data=await jsonResponse(await fetch("/api/models",{cache:"no-store"}));
     if(!Array.isArray(data.models))throw new Error("รายการโมเดลไม่ถูกต้อง");
     models=data.models;
+    $("thai-hint").hidden=!data.prompt_enhancer;
     const select=$("model");select.replaceChildren();
     for(const model of models){const option=document.createElement("option");option.value=model.id;option.textContent=model.label+(model.available?"":" · ยังไม่ได้ติดตั้ง");option.disabled=!model.available;select.appendChild(option)}
     const first=models.find(model=>model.available&&model.id===data.default)||models.find(model=>model.available);
@@ -188,13 +190,14 @@ async function generate(event){
     const profile=hasSpeedProfiles(model)?form.elements.profile.value:model.default_profile;
     const job=await jsonResponse(await fetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt,model:model.id,negative:model.supports_negative?$("negative").value:"",profile,resolution:Number(form.elements.resolution.value),reference:model.supports_reference?(refData||undefined):undefined})}));
     if(!job.id)throw new Error("ระบบไม่ส่งหมายเลขงานกลับมา");
-    const waitText=model.id==="qwen-image-2.1"?({fast:"ประมาณ 1-2 นาที",medium:"ประมาณ 2-3 นาที",quality:"ประมาณ 4-5 นาที"}[job.profile]||"ประมาณ 2-3 นาที"):"อาจใช้เวลาหลายนาที";
+    const waitText=model.id==="qwen-image-2.1"?({fast:"ประมาณ 1 นาที",medium:"ประมาณ 1-2 นาที",quality:"ประมาณ 2-3 นาที"}[job.profile]||"ประมาณ 1-2 นาที"):"อาจใช้เวลาหลายนาที";
     const modeName={fast:"เร็ว",medium:"ปานกลาง",quality:"เน้นคุณภาพ",standard:"มาตรฐาน"}[job.profile]||job.profile;
     $("wait-note").textContent=(model.id==="qwen-image-2.1"?"ใช้เวลา":"งานใหม่หรือการสลับโมเดล")+waitText+" กรุณาเปิดหน้านี้ไว้";
     setStatus("รับงานแล้ว · "+model.label+" · โหมด"+modeName+(model.supports_reference&&refData?" · ใช้รูปอ้างอิงใบหน้า":""));
     while(true){
       await new Promise(resolve=>setTimeout(resolve,3000));
       const state=await jsonResponse(await fetch("/api/status/"+encodeURIComponent(job.id)));
+      if(state.stage==="translating")setStatus("กำลังแปลคำบรรยายภาษาไทยเป็นภาษาอังกฤษ…");
       if(state.status==="done"){
         const imageUrl="/api/image/"+encodeURIComponent(job.id);
         $("result").src=imageUrl;$("download").href=imageUrl;$("download").style.display="inline-block";show("result");

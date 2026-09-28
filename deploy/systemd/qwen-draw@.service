@@ -11,6 +11,8 @@ Environment=COMFY_HOME=%h/ComfyUI
 Environment=COMFY_URL=http://127.0.0.1:8188
 Environment=DRAW_HOST=127.0.0.1
 Environment=DRAW_PORT=8190
+Environment=ENRICHER_URL=http://127.0.0.1:11434/v1/chat/completions
+Environment=ENRICHER_MODEL=hf.co/typhoon-ai/typhoon2.5-qwen3-4b-gguf:Q4_K_M
 ExecStart=/usr/bin/python3 %h/thanipitak-agent/draw_server.py
 Restart=on-failure
 RestartSec=3

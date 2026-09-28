@@ -29,6 +29,12 @@ FLUX_VAE = "flux2-vae.safetensors"
 MODEL_ROOT = Path(os.environ.get("COMFY_MODEL_ROOT", str(COMFY_HOME / "models")))
 HOST = os.environ.get("DRAW_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DRAW_PORT", "8190"))
+# Optional OpenAI-compatible chat endpoint (Ollama/LM Studio/vLLM) that turns
+# Thai prompts into detailed English ones. Empty = prompts pass through as-is.
+ENRICHER_URL = os.environ.get("ENRICHER_URL", "").rstrip("/")
+ENRICHER_MODEL = os.environ.get("ENRICHER_MODEL", "")
+ENRICHER_TIMEOUT = float(os.environ.get("ENRICHER_TIMEOUT", "60"))
+THAI_RE = re.compile(r"[\u0e00-\u0e7f]")
 DEFAULT_MODEL_ID = "qwen-image-2.1"
 FLUX_MODEL_ID = "flux.2-klein-4b"
 RESOLUTIONS = [512, 640, 768, 896, 1024]
@@ -36,10 +42,12 @@ DEFAULT_NEGATIVE = ""
 JOB_TIMEOUT = 900  # seconds
 MAX_BODY = 12 * 1024 * 1024  # allows a base64 reference image
 MAX_REFERENCE = 10 * 1024 * 1024
+# Qwen-Image-2.1 official recipe is euler/simple at 20 steps; CFG 2.5 (with a
+# negative prompt) buys prompt adherence at 2x UNET passes, CFG 1.0 buys speed.
 PROFILES = {
-    "fast": {"steps": 16, "cfg": 1.0},
-    "medium": {"steps": 25, "cfg": 1.0},
-    "quality": {"steps": 30, "cfg": 2.5},
+    "fast": {"steps": 12, "cfg": 1.0},
+    "medium": {"steps": 20, "cfg": 1.0},
+    "quality": {"steps": 20, "cfg": 2.5},
 }
 MODELS = {
     DEFAULT_MODEL_ID: {
@@ -63,6 +71,59 @@ MODELS = {
 JOBS = {}
 LOCK = threading.Lock()
 HERE = Path(__file__).resolve().parent
+PROMPT_CACHE = {}
+PROMPT_CACHE_MAX = 256
+
+ENHANCER_SYSTEM = (
+    "You translate Thai image-generation prompts into vivid English prompts for a "
+    "text-to-image model. Keep any text inside double quotes exactly as written; "
+    "that text must appear in the picture, so never translate or alter it. Translate "
+    "everything else into natural, detailed English that describes the subject, "
+    "composition, setting, lighting and style. Never add new subjects or change the "
+    "meaning. Reply with only the final prompt, no explanations."
+)
+
+
+def enhance_prompt(prompt):
+    """Translate a Thai prompt into a detailed English one via the configured LLM.
+
+    Returns the original prompt untouched when no enricher is configured, when the
+    prompt contains no Thai, or when anything goes wrong — generation must never
+    fail because of translation.
+    """
+    if not ENRICHER_URL or not THAI_RE.search(prompt):
+        return prompt
+    with LOCK:
+        cached = PROMPT_CACHE.get(prompt)
+    if cached is not None:
+        return cached
+    payload = {
+        "messages": [
+            {"role": "system", "content": ENHANCER_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "think": False,  # ollama reasoning models: skip <think>, others ignore it
+    }
+    if ENRICHER_MODEL:
+        payload["model"] = ENRICHER_MODEL
+    try:
+        req = urllib.request.Request(
+            ENRICHER_URL, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=ENRICHER_TIMEOUT) as r:
+            data = json.loads(r.read().decode())
+        text = data["choices"][0]["message"]["content"]
+        text = re.sub(r"(?s)<think>.*?</think>", "", text).strip()  # qwen3 reasoning
+        if not text or len(text) > 8000:
+            return prompt
+    except Exception:
+        return prompt
+    with LOCK:
+        if len(PROMPT_CACHE) >= PROMPT_CACHE_MAX:
+            PROMPT_CACHE.clear()
+        PROMPT_CACHE[prompt] = text
+    return text
 
 
 def comfy_post(path, payload):
@@ -118,7 +179,8 @@ def available_models():
 
 def model_catalog():
     available = available_models()
-    return {"default": DEFAULT_MODEL_ID, "models": [
+    return {"default": DEFAULT_MODEL_ID, "prompt_enhancer": bool(ENRICHER_URL),
+            "models": [
         {"id": model_id, "label": spec["label"], "available": available[model_id],
          "profiles": spec["profiles"], "default_profile": spec["default_profile"],
          "supports_reference": spec["supports_reference"],
@@ -196,9 +258,20 @@ def build_graph(prompt, negative, resolution, seed, profile, reference=None,
     raise ValueError("unknown model")
 
 
-def run_job(job_id, graph, ref_path=None):
+def run_job(job_id, spec, ref_path=None):
     try:
         try:
+            with LOCK:
+                JOBS[job_id]["stage"] = "translating"
+            final_prompt = enhance_prompt(spec["prompt"])
+            if final_prompt != spec["prompt"]:
+                with LOCK:
+                    JOBS[job_id]["prompt_enhanced"] = final_prompt
+            with LOCK:
+                JOBS[job_id]["stage"] = "sampling"
+            graph = build_graph(final_prompt, spec["negative"], spec["resolution"],
+                                spec["seed"], spec["profile"], spec["reference"],
+                                spec["model_id"])
             resp = comfy_post("/prompt", {"prompt": graph, "client_id": job_id})
             pid = resp.get("prompt_id")
             if not pid:
@@ -346,13 +419,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"error": str(e)})
                 return
         ref_path = reference
-        graph = build_graph(prompt, negative, resolution, seed, profile, reference, model_id)
+        spec = {"prompt": prompt, "negative": negative, "resolution": resolution,
+                "seed": seed, "profile": profile, "reference": reference,
+                "model_id": model_id}
         with LOCK:
             JOBS[job_id] = {"status": "queued", "profile": profile,
                             "model": model_id, "ts": time.time()}
             for old in [j for j, v in JOBS.items() if time.time() - v["ts"] > 3600]:
                 JOBS.pop(old, None)
-        threading.Thread(target=run_job, args=(job_id, graph, ref_path), daemon=True).start()
+        threading.Thread(target=run_job, args=(job_id, spec, ref_path), daemon=True).start()
         self._send(200, {"id": job_id, "profile": profile, "model": model_id})
 
     def log_message(self, *args):

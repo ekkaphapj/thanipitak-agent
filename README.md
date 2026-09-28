@@ -16,6 +16,18 @@ python .\draw_server.py
 
 เปิด `http://127.0.0.1:8190` การตั้งค่าเริ่มต้นของเซิร์ฟเวอร์ใช้ `~/ComfyUI` และพอร์ต `8190`; ปรับได้ด้วย `COMFY_HOME`, `COMFY_URL`, `COMFY_OUTPUT_DIR`, `COMFY_INPUT_DIR`, `COMFY_MODEL_ROOT`, `DRAW_HOST` และ `DRAW_PORT`.
 
+### แปลคำบรรยายภาษาไทยอัตโนมัติ
+
+Qwen-Image เข้าใจคำบรรยายภาษาอังกฤษได้ดีกว่าภาษาไทยอย่างชัดเจน ถ้าตั้งค่า `ENRICHER_URL` เป็น endpoint แบบ OpenAI-compatible (เช่น Ollama `http://127.0.0.1:11434/v1/chat/completions`) เซิร์ฟเวอร์จะตรวจหาอักษรไทยใน prompt แล้วเรียก LLM แปลเป็นภาษาอังกฤษแบบละเอียดก่อนสร้างภาพ โดยคงข้อความในเครื่องหมายคำพูด `" "` ไว้ตรงตามเดิมเพื่อให้ปรากฏในภาพ ถ้าไม่ตั้งค่าหรือ LLM ล่ม ระบบจะส่ง prompt เดิมต่อทันที งานไม่มีวันค้าง:
+
+- `ENRICHER_URL` — endpoint แปล prompt (ว่าง = ปิดการแปล)
+- `ENRICHER_MODEL` — ชื่อโมเดลที่ endpoint ต้องการ (แนะนำโมเดลไทยขนาดเล็ก เช่น Typhoon 4B)
+- `ENRICHER_TIMEOUT` — วินาทีที่รอ (ปกติ 30)
+
+### โปรไฟล์ความเร็ว
+
+ทุกโปรไฟล์ใช้ sampler `euler` + scheduler `simple` ตามสูตรทางการของ Qwen-Image: `fast` 12 steps CFG 1.0 · `medium` 20 steps CFG 1.0 · `quality` 20 steps CFG 2.5 (negative prompt มีผลเฉพาะโปรไฟล์นี้)
+
 เว็บเซิร์ฟเวอร์ควรรับการเชื่อมต่อจาก loopback เท่านั้นเมื่อยังไม่มีระบบยืนยันตัวตน หากต้องเปิดผ่านอินเทอร์เน็ต ให้วาง Cloudflare Access หรือระบบยืนยันตัวตนและ reverse proxy ไว้ด้านหน้า
 
 ## โมเดล
