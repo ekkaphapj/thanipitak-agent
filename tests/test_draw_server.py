@@ -130,6 +130,40 @@ class RunJobTest(unittest.TestCase):
         self.assertIn("comfy down", draw_server.JOBS["job2"]["error"])
 
 
+def make_xlsx():
+    """Minimal two-sheet workbook: headers, a string row, a number row."""
+    shared = ('<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/'
+              'spreadsheetml/2006/main"><si><t>ชื่อสินค้า</t></si><si><t>ยอดขาย</t></si>'
+              '<si><t>หมากฮอสชุดพรีเมียม</t></si></sst>')
+    wb = ('<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/'
+          'spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/'
+          'officeDocument/2006/relationships"><sheets>'
+          '<sheet name="ยอดขาย" sheetId="1" r:id="rId1"/>'
+          '<sheet name="สรุป" sheetId="2" r:id="rId2"/></sheets></workbook>')
+    rels = ('<?xml version="1.0"?><Relationships xmlns="http://schemas.'
+            'openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="t" Target="worksheets/sheet1.xml"/>'
+            '<Relationship Id="rId2" Type="t" Target="worksheets/sheet2.xml"/>'
+            '</Relationships>')
+    sheet1 = ('<?xml version="1.0"?><worksheet xmlns="http://schemas.'
+              'openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+              '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>'
+              '<row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>1500.5</v></c></row>'
+              '</sheetData></worksheet>')
+    sheet2 = ('<?xml version="1.0"?><worksheet xmlns="http://schemas.'
+              'openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+              '<row r="1"><c r="A1"><v>42</v></c><c r="B1" t="b"><v>1</v></c></row>'
+              '</sheetData></worksheet>')
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("xl/sharedStrings.xml", shared)
+        z.writestr("xl/workbook.xml", wb)
+        z.writestr("xl/_rels/workbook.xml.rels", rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet1)
+        z.writestr("xl/worksheets/sheet2.xml", sheet2)
+    return buf.getvalue()
+
+
 class AttachmentExtractTest(unittest.TestCase):
     def test_txt_docx_xlsx(self):
         text, err = draw_server.extract_attachment("notes.txt", "hello สวัสดี".encode())
@@ -146,14 +180,13 @@ class AttachmentExtractTest(unittest.TestCase):
         self.assertIn("Hello world", text)
         self.assertIn("second line", text)
 
-        shared = ('<sst><si><t>ชื่อ</t></si><si><t><r>ยอดขาย</r></t></si></sst>')
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w") as z:
-            z.writestr("xl/sharedStrings.xml", shared)
-        text, err = draw_server.extract_attachment("a.xlsx", buf.getvalue())
+        text, err = draw_server.extract_attachment("a.xlsx", make_xlsx())
         self.assertIsNone(err)
-        self.assertIn("ชื่อ", text)
-        self.assertIn("ยอดขาย", text)
+        self.assertIn("=== ชีต: ยอดขาย ===", text)
+        self.assertIn("ชื่อสินค้า\tยอดขาย", text)
+        self.assertIn("หมากฮอสชุดพรีเมียม\t1500.5", text)
+        self.assertIn("=== ชีต: สรุป ===", text)
+        self.assertIn("42\tTRUE", text)
 
     def test_pdf_uncompressed_and_unreadable(self):
         pdf = b"BT (hello pdf text extractor) Tj ET"

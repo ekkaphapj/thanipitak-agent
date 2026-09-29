@@ -20,6 +20,7 @@ import urllib.request
 import uuid
 import zipfile
 import zlib
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -54,6 +55,7 @@ CHAT_KEEP_ALIVE = os.environ.get("CHAT_KEEP_ALIVE", "30m")
 CHAT_NUM_CTX = int(os.environ.get("CHAT_NUM_CTX", "32768"))  # default 4k cuts long code
 WARMUP_TIMEOUT = 300
 PDF_PAGES_MAX = int(os.environ.get("CHAT_PDF_PAGES", "6"))
+SHEET_ROWS_MAX = int(os.environ.get("CHAT_SHEET_ROWS", "400"))
 DEFAULT_MODEL_ID = "qwen-image-2.1"
 FLUX_MODEL_ID = "flux.2-klein-4b"
 RESOLUTIONS = [512, 640, 768, 896, 1024]
@@ -250,15 +252,100 @@ def extract_docx(data):
 
 
 def extract_xlsx(data):
-    """Shared strings carry most cell text in an Excel file."""
-    with zipfile.ZipFile(__import__("io").BytesIO(data)) as z:
-        try:
-            xml = z.read("xl/sharedStrings.xml").decode("utf-8", "replace")
-        except KeyError:
+    """Readable table text from an Excel workbook: one block per sheet.
+
+    Reads cell grids via the sheet XML (values, numbers, booleans, inline and
+    shared strings) rather than only the shared-strings pool, so models see
+    the actual table layout. Capped at SHEET_ROWS_MAX rows per sheet.
+    """
+    def local(e):
+        return e.tag.rsplit("}", 1)[-1]
+
+    def col_index(ref):
+        letters = re.match(r"([A-Z]+)", ref or "")
+        n = 0
+        if not letters:
+            return 0
+        for ch in letters.group(1):
+            n = n * 26 + (ord(ch) - 64)
+        return n - 1
+
+    def cell_text(c, shared):
+        t = c.get("t")
+        if t == "inlineStr":
+            return "".join(x.text or "" for x in c.iter() if local(x) == "t")
+        v = next((x for x in c if local(x) == "v"), None)
+        if v is None or v.text is None:
             return ""
-        rows = re.split(r"</si>", xml)
-        return "\n".join(_xml_text(r).strip() for r in rows
-                         if _xml_text(r).strip())
+        raw = v.text
+        if t == "s":
+            try:
+                return shared[int(raw)]
+            except (IndexError, ValueError):
+                return raw
+        if t == "b":
+            return "TRUE" if raw.strip() == "1" else "FALSE"
+        if t in ("str", "e"):
+            return raw
+        try:  # plain number: keep ints tidy
+            f = float(raw)
+            return str(int(f)) if f.is_integer() else str(f)
+        except ValueError:
+            return raw
+
+    out = []
+    with zipfile.ZipFile(__import__("io").BytesIO(data)) as z:
+        names = z.namelist()
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            for si in ET.fromstring(z.read("xl/sharedStrings.xml")):
+                shared.append("".join(x.text or "" for x in si.iter()
+                                      if local(x) == "t"))
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+              "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+        try:
+            wb = ET.fromstring(z.read("xl/workbook.xml"))
+            rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        except (KeyError, ET.ParseError):
+            return ""
+        rid_target = {rel.get("Id"): rel.get("Target") for rel in rels}
+        sheets = [(s.get("name", "Sheet"),
+                   rid_target.get(s.get("{%s}id" % ns["r"], "")))
+                  for s in wb.findall(".//m:sheet", ns)]
+        for sheet_name, target in sheets:
+            if not target:
+                continue
+            path = target.lstrip("/")
+            if not path.startswith("xl/"):
+                path = "xl/" + path
+            if path not in names:
+                continue
+            grid = []
+            width = 0
+            truncated = False
+            for row in ET.fromstring(z.read(path)).iter():
+                if local(row) != "row":
+                    continue
+                cells = sorted(
+                    ((col_index(c.get("r")), cell_text(c, shared))
+                     for c in row if local(c) == "c"),
+                    key=lambda p: p[0])
+                if cells:
+                    width = max(width, cells[-1][0] + 1)
+                    grid.append(cells)
+                if len(grid) >= SHEET_ROWS_MAX:
+                    truncated = True
+                    break
+            block = [f"=== ชีต: {sheet_name} ==="]
+            for cells in grid:
+                line = [""] * width
+                for idx, text in cells:
+                    line[idx] = text.replace("\t", " ").replace("\n", " ")
+                block.append("\t".join(line).rstrip())
+            if truncated:
+                block.append(f"… (แสดง {SHEET_ROWS_MAX} แถวแรก)")
+            out.append("\n".join(block))
+    return "\n\n".join(out)
 
 
 def extract_pdf(data):
@@ -393,7 +480,7 @@ def extract_attachment(name, data):
             return data.decode("utf-8", "replace"), None
         if ext in ("docx",):
             return extract_docx(data), None
-        if ext in ("xlsx",):
+        if ext in ("xlsx", "xlsm"):
             return extract_xlsx(data) or None, None
         if ext in ("pdf",):
             text = extract_pdf(data)
