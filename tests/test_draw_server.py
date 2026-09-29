@@ -311,6 +311,8 @@ class ChatHttpTest(unittest.TestCase):
         self.assertEqual(sent["model"], "qwen3:8b")
         self.assertEqual(sent["stream"], True)
         self.assertEqual(sent["keep_alive"], draw_server.CHAT_KEEP_ALIVE)
+        self.assertEqual(sent["num_ctx"], draw_server.CHAT_NUM_CTX)
+        self.assertEqual(sent["num_predict"], -1)
         self.assertIn("payload", sent["messages"][-1]["content"])
         free.assert_called_once()
         warm.assert_called_once_with("qwen3:8b")
@@ -349,6 +351,18 @@ class ChatHttpTest(unittest.TestCase):
             with self.chat_post(body) as response:
                 rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
         self.assertGreaterEqual(len([r for r in rows if "beat" in r]), 1)
+        self.assertTrue(rows[-1]["done"])
+
+    def test_length_cut_reports_truncation(self):
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        cut = [{"message": {"content": "partial"}, "done": False},
+               {"message": {"content": ""}, "done": True, "done_reason": "length"}]
+        with self.ollama_mock(cut), \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"):
+            with self.chat_post(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        self.assertTrue(rows[-2]["truncated"])
         self.assertTrue(rows[-1]["done"])
 
     def test_image_without_vision_model_is_rejected(self):

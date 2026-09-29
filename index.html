@@ -451,6 +451,7 @@ $("chat-form").addEventListener("submit",async event=>{
         if(chunk.stage)reply.textContent=chunk.stage==="freeing"?"กำลังปล่อยหน่วยความจำ GPU จาก ComfyUI…":"กำลังโหลดโมเดลเข้า GPU…";
         if(chunk.notes)for(const n of chunk.notes){const note=document.createElement("span");note.className="note";note.textContent="⚠ "+n;reply.appendChild(note)}
         if(chunk.delta){full+=chunk.delta;reply.innerHTML=mdLite(full)+'<span class="cursor"></span>';$("chat-log").scrollTop=$("chat-log").scrollHeight}
+        if(chunk.truncated){const note=document.createElement("span");note.className="note";note.textContent="⚠ คำตอบถูกตัดเพราะเต็มขอบเขตความจำ — พิมพ์ \"ต่อ\" เพื่อให้เขียนต่อจากที่ค้างไว้";reply.appendChild(note)}
         if(chunk.done){
           reply.innerHTML=mdLite(full);
           if(full){const cp=document.createElement("button");cp.type="button";cp.className="msg-copy";cp.textContent="⧉ คัดลองข้อความ";cp._raw=full;reply.appendChild(cp)}
