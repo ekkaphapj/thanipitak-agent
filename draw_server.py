@@ -32,7 +32,8 @@ MODEL = "qwen-image-2.1-UC-Q4_K_M.gguf"
 TEXT_ENCODER = "qwen3vl_8b_int8_convrot.safetensors"
 VAE = "qwen_image_2.1_vae_bf16.safetensors"
 FLUX_MODEL = "flux-2-klein-4b-fp8.safetensors"
-FLUX_TEXT_ENCODER = "qwen_3_4b.safetensors"
+FLUX_TEXT_ENCODER = os.environ.get(
+    "FLUX_TEXT_ENCODER", "qwen_3_4b.safetensors")
 FLUX_VAE = "flux2-vae.safetensors"
 MODEL_ROOT = Path(os.environ.get("COMFY_MODEL_ROOT", str(COMFY_HOME / "models")))
 HOST = os.environ.get("DRAW_HOST", "127.0.0.1")
@@ -701,10 +702,12 @@ def build_qwen_graph(prompt, negative, resolution, seed, profile, reference=None
 
 def build_flux_graph(prompt, resolution, seed):
     """ComfyUI's distilled FLUX.2 Klein path: four Euler steps, CFG 1."""
+    # GGUF text encoders load through ComfyUI-GGUF's loader node
+    loader = "CLIPLoaderGGUF" if FLUX_TEXT_ENCODER.endswith(".gguf") else "CLIPLoader"
     return {
         "1": {"class_type": "UNETLoader", "inputs": {
             "unet_name": FLUX_MODEL, "weight_dtype": "default"}},
-        "2": {"class_type": "CLIPLoader", "inputs": {
+        "2": {"class_type": loader, "inputs": {
             "clip_name": FLUX_TEXT_ENCODER, "type": "flux2", "device": "default"}},
         "3": {"class_type": "CLIPTextEncode", "inputs": {
             "clip": ["2", 0], "text": prompt}},
