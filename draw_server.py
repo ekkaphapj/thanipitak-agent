@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Thai image-generation UI backed by allowlisted local ComfyUI models.
+"""Thai image-generation UI + local AI webchat backed by ComfyUI and Ollama.
 
 Stdlib only. Binds to 127.0.0.1:8190 — reach it through the Cloudflare tunnel.
-Job flow: POST /api/generate -> poll GET /api/status/<id> -> GET /api/image/<id>.
-The async job pattern keeps every HTTP response short so Cloudflare never times out.
+Draw jobs: POST /api/generate -> poll GET /api/status/<id> -> GET /api/image/<id>.
+Chat: POST /api/chat streams NDJSON deltas while Ollama generates.
+Both async patterns keep HTTP responses short so Cloudflare never times out.
 """
 import base64
+import binascii
 import json
 import os
 import re
@@ -13,6 +15,8 @@ import threading
 import time
 import urllib.request
 import uuid
+import zipfile
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -35,6 +39,13 @@ ENRICHER_URL = os.environ.get("ENRICHER_URL", "").rstrip("/")
 ENRICHER_MODEL = os.environ.get("ENRICHER_MODEL", "")
 ENRICHER_TIMEOUT = float(os.environ.get("ENRICHER_TIMEOUT", "60"))
 THAI_RE = re.compile(r"[\u0e00-\u0e7f]")
+# Local Ollama powering the webchat tab; models must already be pulled.
+OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+CHAT_MAX_BODY = 40 * 1024 * 1024
+CHAT_MAX_FILE = 10 * 1024 * 1024
+CHAT_MAX_IMAGES = 4
+CHAT_MAX_DOCS = 4
+CHAT_TIMEOUT = 600
 DEFAULT_MODEL_ID = "qwen-image-2.1"
 FLUX_MODEL_ID = "flux.2-klein-4b"
 RESOLUTIONS = [512, 640, 768, 896, 1024]
@@ -199,6 +210,154 @@ def available_models():
     }
 
 
+# ---- local webchat (Ollama) ------------------------------------------------
+
+def ollama_tags():
+    with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=15) as r:
+        return json.loads(r.read().decode()).get("models", [])
+
+
+def chat_models():
+    """Chat-capable Ollama models, flagging which can see images."""
+    models = []
+    for m in ollama_tags():
+        caps = m.get("capabilities") or []
+        if caps and "completion" not in caps:  # embeddings etc.
+            continue
+        models.append({"id": m["model"], "label": m["model"],
+                       "vision": "vision" in caps})
+    return {"models": models}
+
+
+def _xml_text(xml):
+    return re.sub(r"<[^>]+>", "", xml)
+
+
+def extract_docx(data):
+    """Body text from a Word file (it is a zip of XML)."""
+    with zipfile.ZipFile(__import__("io").BytesIO(data)) as z:
+        xml = z.read("word/document.xml").decode("utf-8", "replace")
+    xml = re.sub(r"</w:p>", "\n", xml)
+    return _xml_text(xml).strip()
+
+
+def extract_xlsx(data):
+    """Shared strings carry most cell text in an Excel file."""
+    with zipfile.ZipFile(__import__("io").BytesIO(data)) as z:
+        try:
+            xml = z.read("xl/sharedStrings.xml").decode("utf-8", "replace")
+        except KeyError:
+            return ""
+        rows = re.split(r"</si>", xml)
+        return "\n".join(_xml_text(r).strip() for r in rows
+                         if _xml_text(r).strip())
+
+
+def extract_pdf(data):
+    """Best-effort stdlib PDF text: inflate streams, read text operators.
+
+    Embedded/custom encodings (very common for Thai) can defeat this; the
+    caller tells the user when nothing readable came out.
+    """
+    out = []
+    scanned = []
+
+    def scan(raw):
+        for op in re.finditer(rb"\((?:\\.|[^\\()])*\)\s*Tj", raw):
+            s = op.group(0)[1:op.group(0).rindex(b")")]
+            s = s.replace(b"\\(", b"(").replace(b"\\)", b")").replace(b"\\\\", b"\\")
+            out.append(s.decode("latin-1", "replace"))
+
+    for m in re.finditer(rb"stream\r?\n(.*?)endstream", data, re.S):
+        raw = m.group(1)
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            pass
+        scanned.append(raw)
+        scan(raw)
+    if not out:  # uncompressed PDFs keep text operators outside streams
+        scan(data)
+    return " ".join(out).strip()
+
+
+def extract_attachment(name, data):
+    """-> (text, error message). Exactly one is None."""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    try:
+        if ext in ("txt", "md", "csv", "json", "py", "log", "xml", "html"):
+            return data.decode("utf-8", "replace"), None
+        if ext in ("docx",):
+            return extract_docx(data), None
+        if ext in ("xlsx",):
+            return extract_xlsx(data) or None, None
+        if ext in ("pdf",):
+            text = extract_pdf(data)
+            if len(text) < 20:
+                return None, "อ่านข้อความจาก PDF นี้ไม่ได้ (ฟอนต์ฝังแบบพิเศษ) ลองคัดลอกข้อความมาแนบเป็น .txt แทน"
+            return text, None
+    except Exception:
+        return None, "เปิดไฟล์ไม่สำเร็จ"
+    return None, "ชนิดไฟล์นี้ยังไม่รองรับ"
+
+
+def build_chat_messages(payload):
+    """Validate a chat request and turn it into Ollama messages.
+
+    History entries pass through as {role, content}; the final user entry may
+    carry images (base64) and doc attachments whose extracted text is inlined
+    into the content so it stays in context for later turns.
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages or len(messages) > 80:
+        raise ValueError("invalid message history")
+    out = []
+    for m in messages[:-1]:
+        if (not isinstance(m, dict) or m.get("role") not in ("user", "assistant")
+                or not isinstance(m.get("content"), str)):
+            raise ValueError("invalid message history")
+        out.append({"role": m["role"], "content": m["content"]})
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "user" \
+            or not isinstance(last.get("content"), str):
+        raise ValueError("invalid message history")
+    content = last["content"].strip()
+    images = last.get("images") or []
+    docs = last.get("docs") or []
+    if not isinstance(images, list) or len(images) > CHAT_MAX_IMAGES:
+        raise ValueError(f"too many images (max {CHAT_MAX_IMAGES})")
+    if not isinstance(docs, list) or len(docs) > CHAT_MAX_DOCS:
+        raise ValueError(f"too many documents (max {CHAT_MAX_DOCS})")
+    blocks, errors = [], []
+    for doc in docs:
+        if not isinstance(doc, dict) or not isinstance(doc.get("data"), str):
+            raise ValueError("invalid attachment")
+        try:
+            data = base64.b64decode(doc["data"], validate=False)
+        except (binascii.Error, ValueError):
+            errors.append(f"{doc.get('name', '?')}: ไฟล์เสียหาย"); continue
+        if len(data) > CHAT_MAX_FILE:
+            errors.append(f"{doc.get('name', '?')}: ใหญ่เกิน 10MB"); continue
+        text, err = extract_attachment(str(doc.get("name", "file")), data)
+        if err:
+            errors.append(f"{doc.get('name', '?')}: {err}"); continue
+        blocks.append(f"ไฟล์แนบ {doc.get('name')}:\n{text[:60000]}")
+    if not content and not blocks and not images:
+        raise ValueError("message is empty")
+    if blocks:
+        content = (content + "\n\n" if content else "") + "\n\n".join(blocks)
+    msg = {"role": "user", "content": content or "(ดูรูปภาพที่แนบมา)"}
+    if images:
+        clean = []
+        for img in images:
+            if not isinstance(img, str):
+                raise ValueError("invalid image")
+            clean.append(img.split(",", 1)[-1])  # tolerate data URLs
+        msg["images"] = clean
+    out.append(msg)
+    return out, bool(images), errors
+
+
 def model_catalog():
     available = available_models()
     return {"default": DEFAULT_MODEL_ID, "prompt_enhancer": bool(ENRICHER_URL),
@@ -351,6 +510,48 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _stream_chat(self, model_id, messages, notes):
+        payload = {"model": model_id, "messages": messages,
+                   "stream": True, "think": False}
+        req = urllib.request.Request(
+            OLLAMA + "/api/chat", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        def emit(obj):
+            self.wfile.write(json.dumps(obj, ensure_ascii=False).encode() + b"\n")
+            self.wfile.flush()
+
+        if notes:
+            emit({"notes": notes})
+        # exact user content (docs inlined) so the browser history matches
+        # what the model saw and follow-up questions keep the file context
+        emit({"user_content": messages[-1]["content"]})
+        try:
+            with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as r:
+                for line in r:
+                    if not line.strip():
+                        continue
+                    try:
+                        chunk = json.loads(line.decode("utf-8", "replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    delta = chunk.get("message", {}).get("content", "")
+                    if chunk.get("done"):
+                        emit({"done": True})
+                        return
+                    if delta:
+                        emit({"delta": delta})
+            emit({"done": True})
+        except Exception as e:  # tell the browser instead of dying mid-stream
+            try:
+                emit({"error": str(e)[:300]})
+            except OSError:
+                pass
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             html = (HERE / "index.html").read_text(encoding="utf-8")
@@ -361,6 +562,11 @@ class Handler(BaseHTTPRequestHandler):
                                                   if m["available"]]})
         elif self.path == "/api/models":
             self._send(200, model_catalog())
+        elif self.path == "/api/chat/models":
+            try:
+                self._send(200, chat_models())
+            except Exception:
+                self._send(503, {"error": "ollama ไม่พร้อมใช้งาน"})
         elif self.path.startswith("/api/status/"):
             jid = self.path.rsplit("/", 1)[-1]
             with LOCK:
@@ -388,6 +594,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/api/chat":
+            self._handle_chat()
+            return
         if self.path != "/api/generate":
             self._send(404, {"error": "not found"})
             return
@@ -457,6 +666,39 @@ class Handler(BaseHTTPRequestHandler):
                 JOBS.pop(old, None)
         threading.Thread(target=run_job, args=(job_id, spec, ref_path), daemon=True).start()
         self._send(200, {"id": job_id, "profile": profile, "model": model_id})
+
+    def _handle_chat(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > CHAT_MAX_BODY:
+                raise ValueError("invalid body length")
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("invalid body")
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            self._send(400, {"error": "invalid json"})
+            return
+        model_id = body.get("model")
+        if not isinstance(model_id, str) or not model_id:
+            self._send(400, {"error": "กรุณาเลือกโมเดล"})
+            return
+        try:
+            known = {m["id"]: m for m in chat_models()["models"]}
+        except Exception:
+            self._send(503, {"error": "ollama ไม่พร้อมใช้งาน"})
+            return
+        if model_id not in known:
+            self._send(400, {"error": "ไม่พบโมเดลนี้"})
+            return
+        try:
+            messages, has_images, notes = build_chat_messages(body)
+        except ValueError as e:
+            self._send(400, {"error": str(e)})
+            return
+        if has_images and not known[model_id]["vision"]:
+            self._send(400, {"error": "โมเดลที่เลือกไม่รองรับรูปภาพ กรุณาเลือกโมเดลที่มีป้าย 'เห็นภาพ'"})
+            return
+        self._stream_chat(model_id, messages, notes)
 
     def log_message(self, *args):
         pass

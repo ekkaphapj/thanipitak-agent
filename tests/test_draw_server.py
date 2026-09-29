@@ -1,4 +1,6 @@
 """Focused checks for the separate ComfyUI draw service."""
+import base64
+import io
 import json
 import sys
 import threading
@@ -6,6 +8,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -125,6 +128,172 @@ class RunJobTest(unittest.TestCase):
             draw_server.run_job("job2", spec)
         self.assertEqual(draw_server.JOBS["job2"]["status"], "error")
         self.assertIn("comfy down", draw_server.JOBS["job2"]["error"])
+
+
+class AttachmentExtractTest(unittest.TestCase):
+    def test_txt_docx_xlsx(self):
+        text, err = draw_server.extract_attachment("notes.txt", "hello สวัสดี".encode())
+        self.assertIsNone(err)
+        self.assertIn("สวัสดี", text)
+
+        doc_xml = ("<w:document><w:body><w:p>Hello <w:r><w:t>world</w:t></w:r></w:p>"
+                   "<w:p>second line</w:p></w:body></w:document>")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("word/document.xml", doc_xml)
+        text, err = draw_server.extract_attachment("a.docx", buf.getvalue())
+        self.assertIsNone(err)
+        self.assertIn("Hello world", text)
+        self.assertIn("second line", text)
+
+        shared = ('<sst><si><t>ชื่อ</t></si><si><t><r>ยอดขาย</r></t></si></sst>')
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("xl/sharedStrings.xml", shared)
+        text, err = draw_server.extract_attachment("a.xlsx", buf.getvalue())
+        self.assertIsNone(err)
+        self.assertIn("ชื่อ", text)
+        self.assertIn("ยอดขาย", text)
+
+    def test_pdf_uncompressed_and_unreadable(self):
+        pdf = b"BT (hello pdf text extractor) Tj ET"
+        text, err = draw_server.extract_attachment("a.pdf", pdf)
+        self.assertIsNone(err)
+        self.assertIn("hello pdf text extractor", text)
+        text, err = draw_server.extract_attachment("a.pdf", b"not a pdf")
+        self.assertIsNotNone(err)
+
+    def test_unsupported_type(self):
+        text, err = draw_server.extract_attachment("a.exe", b"MZ")
+        self.assertIsNotNone(err)
+
+
+class ChatMessageTest(unittest.TestCase):
+    def base64_(self, raw):
+        return base64.b64encode(raw).decode()
+
+    def test_builds_messages_with_doc_inlined_and_keeps_history(self):
+        doc = base64.b64encode(b"quarterly numbers: 42").decode()
+        payload = {"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "สรุปไฟล์นี้",
+             "images": ["data:image/jpeg;base64,QUJD"],
+             "docs": [{"name": "report.txt", "data": doc}]},
+        ]}
+        messages, has_images, notes = draw_server.build_chat_messages(payload)
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user"])
+        self.assertTrue(has_images)
+        self.assertEqual(notes, [])
+        self.assertEqual(messages[-1]["images"], ["QUJD"])
+        self.assertIn("สรุปไฟล์นี้", messages[-1]["content"])
+        self.assertIn("ไฟล์แนบ report.txt", messages[-1]["content"])
+        self.assertIn("quarterly numbers: 42", messages[-1]["content"])
+
+    def test_rejects_bad_history_and_limits(self):
+        for messages in ([], "nope",
+                         [{"role": "system", "content": "x"}],
+                         [{"role": "user", "content": "x", "images": ["a"] * 5}]):
+            with self.subTest(messages=messages):
+                with self.assertRaises(ValueError):
+                    draw_server.build_chat_messages({"messages": messages})
+
+
+class OllamaStream:
+    """File-like stand-in for a streaming Ollama chat response."""
+
+    def __init__(self, chunks):
+        self.chunks = [json.dumps(c).encode() + b"\n" for c in chunks]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def __iter__(self):
+        return iter(self.chunks)
+
+
+class ChatHttpTest(unittest.TestCase):
+    def setUp(self):
+        draw_server.JOBS.clear()
+        self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.tags = mock.patch.object(draw_server, "ollama_tags", return_value=[
+            {"model": "qwen3:8b", "capabilities": ["completion", "thinking"]},
+            {"model": "vl:4b", "capabilities": ["completion", "vision"]},
+            {"model": "emb", "capabilities": ["embedding"]}])
+        self.tags.start()
+
+    def tearDown(self):
+        self.tags.stop()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        draw_server.JOBS.clear()
+
+    def test_models_endpoint_filters_embeddings_and_flags_vision(self):
+        with urllib.request.urlopen(self.base + "/api/chat/models") as response:
+            data = json.load(response)
+        self.assertEqual([m["id"] for m in data["models"]], ["qwen3:8b", "vl:4b"])
+        self.assertEqual([m["vision"] for m in data["models"]], [False, True])
+
+    def ollama_mock(self, chunks):
+        """Patch urlopen only for Ollama URLs so the test's own calls pass through."""
+        real_urlopen = urllib.request.urlopen
+
+        def selective(url, *args, **kwargs):
+            target = url.full_url if isinstance(url, urllib.request.Request) else url
+            if target.startswith(draw_server.OLLAMA):
+                return OllamaStream(chunks)
+            return real_urlopen(url, *args, **kwargs)
+        return mock.patch.object(urllib.request, "urlopen", side_effect=selective)
+
+    def chat_post(self, body):
+        request = urllib.request.Request(
+            self.base + "/api/chat", json.dumps(body).encode(),
+            {"Content-Type": "application/json"}, method="POST")
+        return urllib.request.urlopen(request, timeout=5)
+
+    def test_chat_streams_deltas_and_user_content(self):
+        lines = [
+            {"message": {"content": "สวัสดี"}, "done": False},
+            {"message": {"content": " ครับ"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ]
+        body = {"model": "qwen3:8b", "messages": [
+            {"role": "user", "content": "hi",
+             "docs": [{"name": "n.txt", "data": base64.b64encode(b"payload").decode()}]}]}
+        with self.ollama_mock(lines) as urlopen:
+            with self.chat_post(body) as response:
+                streamed = response.read().decode()
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["model"], "qwen3:8b")
+        self.assertEqual(sent["stream"], True)
+        self.assertIn("payload", sent["messages"][-1]["content"])
+        rows = [json.loads(l) for l in streamed.splitlines() if l.strip()]
+        self.assertEqual(rows[0]["user_content"], sent["messages"][-1]["content"])
+        self.assertEqual("".join(r["delta"] for r in rows if "delta" in r), "สวัสดี ครับ")
+        self.assertTrue(rows[-1]["done"])
+
+    def test_image_without_vision_model_is_rejected(self):
+        body = {"model": "qwen3:8b", "messages": [
+            {"role": "user", "content": "ดูรูป", "images": ["QUJD"]}]}
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.chat_post(body)
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("ไม่รองรับรูปภาพ",
+                      json.loads(error.exception.read().decode("utf-8"))["error"])
+        error.exception.close()
+
+        body["model"] = "vl:4b"
+        ok = [{"message": {"content": "ok"}, "done": True}]
+        with self.ollama_mock(ok):
+            with self.chat_post(body) as response:
+                self.assertTrue(json.loads(response.read().decode().splitlines()[-1])["done"])
 
 
 class QueuePositionTest(unittest.TestCase):
