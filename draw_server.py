@@ -48,7 +48,7 @@ CHAT_MAX_DOCS = 4
 CHAT_TIMEOUT = 600
 CHAT_HEARTBEAT = 15  # seconds between keepalive lines while Ollama is silent
 CHAT_KEEP_ALIVE = os.environ.get("CHAT_KEEP_ALIVE", "30m")
-CHAT_NUM_CTX = int(os.environ.get("CHAT_NUM_CTX", "16384"))  # default 4k cuts long code
+CHAT_NUM_CTX = int(os.environ.get("CHAT_NUM_CTX", "32768"))  # default 4k cuts long code
 WARMUP_TIMEOUT = 300
 DEFAULT_MODEL_ID = "qwen-image-2.1"
 FLUX_MODEL_ID = "flux.2-klein-4b"
@@ -544,7 +544,9 @@ class Handler(BaseHTTPRequestHandler):
         payload = {"model": model_id, "messages": messages,
                    "stream": True, "think": False,
                    "keep_alive": CHAT_KEEP_ALIVE,
-                   "num_ctx": CHAT_NUM_CTX, "num_predict": -1}
+                   # context knobs only apply inside options{} — top-level
+                   # fields are silently ignored and 4k ctx cuts long code
+                   "options": {"num_ctx": CHAT_NUM_CTX, "num_predict": -1}}
         req = urllib.request.Request(
             OLLAMA + "/api/chat", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
