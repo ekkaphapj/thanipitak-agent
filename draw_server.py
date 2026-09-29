@@ -508,9 +508,26 @@ def free_comfy_vram():
         return False
 
 
+def chat_model_ready(model_id):
+    """True when the model sits in VRAM right now (Ollama /api/ps)."""
+    try:
+        with urllib.request.urlopen(OLLAMA + "/api/ps", timeout=10) as r:
+            models = json.loads(r.read().decode()).get("models", [])
+        for m in models:
+            if model_id in (m.get("name"), m.get("model")):
+                total = m.get("size") or 1
+                return (m.get("size_vram") or 0) >= 0.5 * total
+    except Exception:
+        pass
+    return False
+
+
 def warm_chat_model(model_id):
     """Load a chat model into VRAM without generating anything."""
-    payload = {"model": model_id, "keep_alive": CHAT_KEEP_ALIVE}
+    payload = {"model": model_id, "keep_alive": CHAT_KEEP_ALIVE,
+               # must match the chat runner options or Ollama treats it as a
+               # different instance and reloads on every message
+               "options": {"num_ctx": CHAT_NUM_CTX}}
     req = urllib.request.Request(
         OLLAMA + "/api/generate", data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"})
@@ -775,13 +792,11 @@ class Handler(BaseHTTPRequestHandler):
                         return
 
         threading.Thread(target=heartbeat, daemon=True).start()
-        try:
+        if not chat_model_ready(model_id):
             emit({"stage": "freeing"})
             free_comfy_vram()
             emit({"stage": "loading"})
             warm_chat_model(model_id)
-        except Exception as e:  # prep failed — the chat call may still load it
-            emit({"notes": [f"เตรียม GPU ไม่สำเร็จ ({str(e)[:120]}) ลองตอบต่อแบบช้า"]})
         try:
             with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as r:
                 for line in r:

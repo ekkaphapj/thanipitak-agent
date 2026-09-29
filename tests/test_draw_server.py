@@ -272,7 +272,7 @@ class FreeComfyVramTest(unittest.TestCase):
 
 
 class WarmModelTest(unittest.TestCase):
-    def test_warmup_loads_model_with_keep_alive(self):
+    def test_warmup_matches_chat_runner_options(self):
         stream = OllamaStream([{"done": True}])
         with mock.patch.object(urllib.request, "urlopen",
                                return_value=stream) as urlopen:
@@ -280,7 +280,33 @@ class WarmModelTest(unittest.TestCase):
         sent = json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(sent["model"], "typhoon2.5-4b")
         self.assertEqual(sent["keep_alive"], draw_server.CHAT_KEEP_ALIVE)
+        self.assertEqual(sent["options"]["num_ctx"], draw_server.CHAT_NUM_CTX)
         self.assertNotIn("prompt", sent)
+
+    def test_chat_model_ready_reads_ps(self):
+        class PsResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"models": [
+                    {"name": "hot:1", "size": 10, "size_vram": 8},
+                    {"name": "cpu:1", "size": 10, "size_vram": 2},
+                ]}).encode()
+
+        real = urllib.request.urlopen
+        def selective(url, *a, **k):
+            target = url.full_url if isinstance(url, urllib.request.Request) else url
+            if target.startswith(draw_server.OLLAMA):
+                return PsResponse()
+            return real(url, *a, **k)
+        with mock.patch.object(urllib.request, "urlopen", side_effect=selective):
+            self.assertTrue(draw_server.chat_model_ready("hot:1"))
+            self.assertFalse(draw_server.chat_model_ready("cpu:1"))
+            self.assertFalse(draw_server.chat_model_ready("missing:1"))
 
 
 class ChatHttpTest(unittest.TestCase):
@@ -337,6 +363,7 @@ class ChatHttpTest(unittest.TestCase):
             {"role": "user", "content": "hi",
              "docs": [{"name": "n.txt", "data": base64.b64encode(b"payload").decode()}]}]}
         with self.ollama_mock(lines) as urlopen, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=False), \
              mock.patch.object(draw_server, "free_comfy_vram", return_value=True) as free, \
              mock.patch.object(draw_server, "warm_chat_model") as warm:
             with self.chat_post(body) as response:
@@ -388,6 +415,21 @@ class ChatHttpTest(unittest.TestCase):
             with self.chat_post(body) as response:
                 rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
         self.assertGreaterEqual(len([r for r in rows if "beat" in r]), 1)
+        self.assertTrue(rows[-1]["done"])
+
+    def test_loaded_model_skips_free_and_warm(self):
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        lines = [{"message": {"content": "ok"}, "done": True,
+                  "prompt_eval_count": 5, "eval_count": 3}]
+        with self.ollama_mock(lines) as urlopen, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True), \
+             mock.patch.object(draw_server, "free_comfy_vram") as free, \
+             mock.patch.object(draw_server, "warm_chat_model") as warm:
+            with self.chat_post(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        free.assert_not_called()
+        warm.assert_not_called()
+        self.assertNotIn("stage", [k for r in rows for k in r])
         self.assertTrue(rows[-1]["done"])
 
     def test_length_cut_reports_truncation(self):
