@@ -8,6 +8,8 @@ Both async patterns keep HTTP responses short so Cloudflare never times out.
 """
 import base64
 import binascii
+import html
+import io
 import json
 import os
 import re
@@ -18,6 +20,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 import xml.etree.ElementTree as ET
@@ -65,12 +68,14 @@ DEFAULT_NEGATIVE = ""
 JOB_TIMEOUT = 900  # seconds
 MAX_BODY = 12 * 1024 * 1024  # allows a base64 reference image
 MAX_REFERENCE = 10 * 1024 * 1024
-# Qwen-Image-2.1 official recipe is euler/simple at 20 steps; CFG 2.5 (with a
-# negative prompt) buys prompt adherence at 2x UNET passes, CFG 1.0 buys speed.
+# Qwen-Image-2.1 is distilled. The ComfyUI template samples euler/simple at
+# CFG 1.0 for 25 steps; CFG above 1 blurs the picture and costs a second UNET
+# pass. Profiles only change the step count. At CFG 1 the sampler ignores
+# negative conditioning, so exclusions are appended to the positive prompt.
 PROFILES = {
     "fast": {"steps": 12, "cfg": 1.0},
     "medium": {"steps": 20, "cfg": 1.0},
-    "quality": {"steps": 20, "cfg": 2.5},
+    "quality": {"steps": 25, "cfg": 1.0},
 }
 MODELS = {
     DEFAULT_MODEL_ID: {
@@ -99,13 +104,52 @@ PROMPT_CACHE_MAX = 256
 CHAT_CAPABILITY_CACHE = {}
 
 ENHANCER_SYSTEM = (
-    "You translate Thai image-generation prompts into vivid English prompts for a "
-    "text-to-image model. Keep any text inside double quotes exactly as written; "
-    "that text must appear in the picture, so never translate or alter it. Translate "
-    "everything else into natural, detailed English that describes the subject, "
-    "composition, setting, lighting and style. Never add new subjects or change the "
-    "meaning. Reply with only the final prompt, no explanations."
+    "You translate Thai image-generation prompts into English prompts for a "
+    "text-to-image model. Keep the same subjects, counts, colors, positions and "
+    "negations. Never add a subject that was not asked for. "
+    "Keep any text inside double quotes exactly as written; that text must appear "
+    "in the picture, so never translate or alter it. "
+    "ตัวหนังสือ and ตัวอักษร mean rendered letters or text in the image, not books "
+    "(หนังสือ). \"ไม่มีตัวหนังสือ\" means no rendered text or letters are visible. "
+    "A line that starts with \"Avoid:\" lists things that must NOT appear. Keep the "
+    "word \"Avoid:\" exactly, translate only that list, and never turn those items "
+    "into things that are present. "
+    "Reply with only the final prompt, no explanations.\n"
+    "Examples:\n"
+    "แมวสีส้มหนึ่งตัวนั่งอ่านหนังสือ ไม่มีตัวหนังสือในภาพ\n"
+    "-> One orange cat sitting and reading a book. No rendered text or letters are visible.\n"
+    "ป้ายเขียนว่า \"สวัสดี\"\n"
+    "-> A sign that reads \"สวัสดี\".\n"
+    "เสื้อสีแดงสามตัวบนโต๊ะไม้\n"
+    "-> Three red shirts on a wooden table."
 )
+QUOTED_RE = re.compile(r'"([^"\n]+)"')
+
+
+def compose_prompt(prompt, negative):
+    """Append exclusions where CFG 1 can see them: on the positive prompt."""
+    negative = (negative or "").strip()
+    if not negative:
+        return prompt
+    return prompt.rstrip() + "\nAvoid: " + negative
+
+
+def _translation_ok(source, text):
+    """Reject a rewrite that drops quoted text, the Avoid line, or lettering."""
+    if not text or len(text) > 8000:
+        return False
+    for quoted in QUOTED_RE.findall(source):
+        if quoted not in text:
+            return False
+    if "\nAvoid:" in "\n" + source and "Avoid:" not in text:
+        return False
+    if "ตัวหนังสือ" in source or "ตัวอักษร" in source:
+        lowered = text.lower()
+        if not any(word in lowered for word in (
+                "letter", "letters", "text", "writing", "glyph",
+                "inscription", "caption", "typography")):
+            return False
+    return True
 
 
 def enhance_prompt(prompt):
@@ -126,7 +170,7 @@ def enhance_prompt(prompt):
             {"role": "system", "content": ENHANCER_SYSTEM},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.3,
+        "temperature": 0,
         "think": False,  # ollama reasoning models: skip <think>, others ignore it
     }
     if ENRICHER_MODEL:
@@ -139,8 +183,9 @@ def enhance_prompt(prompt):
             data = json.loads(r.read().decode())
         text = data["choices"][0]["message"]["content"]
         text = re.sub(r"(?s)<think>.*?</think>", "", text).strip()  # qwen3 reasoning
-        if not text or len(text) > 8000:
-            return prompt
+        text = re.sub(r"^(prompt|translation|english)\s*:\s*", "", text, flags=re.I).strip()
+        if not _translation_ok(prompt, text):
+            text = prompt
     except Exception:
         return prompt
     with LOCK:
@@ -231,12 +276,17 @@ def ollama_tags():
 
 
 def chat_models():
-    """Chat-capable Ollama models, flagging which can see images."""
+    """Chat-capable Ollama models, flagging which can see images.
+
+    /api/tags sometimes omits capabilities. Treating that as "no vision" hides
+    vision models and lets embedding models through, so fall back to /api/show.
+    """
     models = []
     for m in ollama_tags():
+        model_id = m["model"]
         caps = m.get("capabilities") or []
         if not caps:
-            key = (OLLAMA, m["model"], m.get("digest"), m.get("modified_at"))
+            key = (OLLAMA, model_id, m.get("digest"), m.get("modified_at"))
             with LOCK:
                 cached = CHAT_CAPABILITY_CACHE.get(key)
             if cached and time.monotonic() - cached[0] < 300:
@@ -245,7 +295,7 @@ def chat_models():
                 try:
                     req = urllib.request.Request(
                         OLLAMA + "/api/show",
-                        data=json.dumps({"model": m["model"]}).encode(),
+                        data=json.dumps({"model": model_id}).encode(),
                         headers={"Content-Type": "application/json"})
                     with urllib.request.urlopen(req, timeout=15) as r:
                         caps = json.loads(r.read().decode()).get("capabilities") or []
@@ -257,18 +307,19 @@ def chat_models():
                     caps = []  # allow text chat when capability discovery fails
         if caps and "completion" not in caps:  # embeddings etc.
             continue
-        models.append({"id": m["model"], "label": m["model"],
+        models.append({"id": model_id, "label": model_id,
                        "vision": "vision" in caps})
     return {"models": models}
 
 
 def _xml_text(xml):
-    return re.sub(r"<[^>]+>", "", xml)
+    # Strip tags first so an escaped "<" does not become a tag, then unescape.
+    return html.unescape(re.sub(r"<[^>]+>", "", xml))
 
 
 def extract_docx(data):
     """Body text from a Word file (it is a zip of XML)."""
-    with zipfile.ZipFile(__import__("io").BytesIO(data)) as z:
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
         xml = z.read("word/document.xml").decode("utf-8", "replace")
     xml = re.sub(r"</w:p>", "\n", xml)
     return _xml_text(xml).strip()
@@ -279,7 +330,9 @@ def extract_xlsx(data):
 
     Reads cell grids via the sheet XML (values, numbers, booleans, inline and
     shared strings) rather than only the shared-strings pool, so models see
-    the actual table layout. Capped at SHEET_ROWS_MAX rows per sheet.
+    the actual table layout. Capped at SHEET_ROWS_MAX rows per sheet. A file
+    with no workbook map still yields any worksheet XML it does contain.
+    Returns "" when nothing usable is present.
     """
     def local(e):
         return e.tag.rsplit("}", 1)[-1]
@@ -288,7 +341,7 @@ def extract_xlsx(data):
         letters = re.match(r"([A-Z]+)", ref or "")
         n = 0
         if not letters:
-            return 0
+            return None
         for ch in letters.group(1):
             n = n * 26 + (ord(ch) - 64)
         return n - 1
@@ -317,7 +370,7 @@ def extract_xlsx(data):
             return raw
 
     out = []
-    with zipfile.ZipFile(__import__("io").BytesIO(data)) as z:
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
         names = z.namelist()
         shared = []
         if "xl/sharedStrings.xml" in names:
@@ -329,12 +382,13 @@ def extract_xlsx(data):
         try:
             wb = ET.fromstring(z.read("xl/workbook.xml"))
             rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+            rid_target = {rel.get("Id"): rel.get("Target") for rel in rels}
+            sheets = [(s.get("name", "Sheet"),
+                       rid_target.get(s.get("{%s}id" % ns["r"], "")))
+                      for s in wb.findall(".//m:sheet", ns)]
         except (KeyError, ET.ParseError):
-            return ""
-        rid_target = {rel.get("Id"): rel.get("Target") for rel in rels}
-        sheets = [(s.get("name", "Sheet"),
-                   rid_target.get(s.get("{%s}id" % ns["r"], "")))
-                  for s in wb.findall(".//m:sheet", ns)]
+            sheets = [(name.rsplit("/", 1)[-1], name) for name in names
+                      if name.startswith("xl/worksheets/") and name.endswith(".xml")]
         for sheet_name, target in sheets:
             if not target:
                 continue
@@ -349,26 +403,42 @@ def extract_xlsx(data):
             for row in ET.fromstring(z.read(path)).iter():
                 if local(row) != "row":
                     continue
-                cells = sorted(
-                    ((col_index(c.get("r")), cell_text(c, shared))
-                     for c in row if local(c) == "c"),
-                    key=lambda p: p[0])
+                cells = []
+                nxt = 0
+                for c in row:
+                    if local(c) != "c":
+                        continue
+                    idx = col_index(c.get("r"))
+                    if idx is None:
+                        idx = nxt
+                    nxt = idx + 1
+                    cells.append((idx, cell_text(c, shared)))
+                cells.sort(key=lambda p: p[0])
+                # The row that fills the cap is kept; only a further data row
+                # means the sheet was actually cut.
+                if len(grid) >= SHEET_ROWS_MAX:
+                    if cells:
+                        truncated = True
+                        break
+                    continue
                 if cells:
                     width = max(width, cells[-1][0] + 1)
                     grid.append(cells)
-                if len(grid) >= SHEET_ROWS_MAX:
-                    truncated = True
-                    break
+            if not grid:
+                continue
             block = [f"=== ชีต: {sheet_name} ==="]
             for cells in grid:
                 line = [""] * width
                 for idx, text in cells:
-                    line[idx] = text.replace("\t", " ").replace("\n", " ")
+                    if 0 <= idx < width:
+                        line[idx] = text.replace("\t", " ").replace("\n", " ")
                 block.append("\t".join(line).rstrip())
             if truncated:
                 block.append(f"… (แสดง {SHEET_ROWS_MAX} แถวแรก)")
             out.append("\n".join(block))
-    return "\n\n".join(out)
+    if out:
+        return "\n\n".join(out)
+    return "\n".join(s for s in shared if s)
 
 
 def extract_pdf(data):
@@ -530,6 +600,34 @@ def extract_attachment(name, data):
     return None, "ชนิดไฟล์นี้ยังไม่รองรับ"
 
 
+def release_ollama_vram():
+    """Unload chat models so ComfyUI gets the whole GPU.
+
+    An empty prompt with keep_alive 0 is Ollama's unload request. It does not
+    load a model that is not already resident. Failure must not fail the image.
+    """
+    try:
+        with urllib.request.urlopen(OLLAMA + "/api/ps", timeout=5) as r:
+            models = json.loads(r.read().decode()).get("models", [])
+    except Exception:
+        return
+    names = []
+    for model in models:
+        name = model.get("name") or model.get("model")
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    for name in names:
+        payload = {"model": name, "prompt": "", "keep_alive": 0, "stream": False}
+        req = urllib.request.Request(
+            OLLAMA + "/api/generate", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                r.read()
+        except Exception:
+            continue
+
+
 def free_comfy_vram():
     """Unload ComfyUI's models so Ollama can own the whole GPU.
 
@@ -673,12 +771,13 @@ def model_catalog():
 
 def build_qwen_graph(prompt, negative, resolution, seed, profile, reference=None):
     params = PROFILES[profile]
+    prompt = compose_prompt(prompt, negative)
     graph = {
         "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": MODEL}},
         "2": {"class_type": "CLIPLoader", "inputs": {
             "clip_name": TEXT_ENCODER, "type": "qwen_image", "device": "default"}},
         "3": {"class_type": "TextEncodeQwenImage21", "inputs": {
-            "clip": ["2", 0], "prompt": prompt, "negative_prompt": negative,
+            "clip": ["2", 0], "prompt": prompt, "negative_prompt": "",
             "resolution": int(resolution)}},
         "4": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["3", 0], "negative": ["3", 1],
@@ -745,15 +844,22 @@ def build_graph(prompt, negative, resolution, seed, profile, reference=None,
 def run_job(job_id, spec, ref_path=None):
     try:
         try:
+            source = spec["prompt"]
+            if spec.get("model_id", DEFAULT_MODEL_ID) == DEFAULT_MODEL_ID:
+                source = compose_prompt(source, spec.get("negative") or "")
             with LOCK:
                 JOBS[job_id]["stage"] = "translating"
-            final_prompt = enhance_prompt(spec["prompt"])
-            if final_prompt != spec["prompt"]:
-                with LOCK:
+            final_prompt = enhance_prompt(source)
+            with LOCK:
+                if final_prompt != spec["prompt"]:
                     JOBS[job_id]["prompt_enhanced"] = final_prompt
+                # Drop the chat model after translation. The enricher itself
+                # may be the model now sitting on the GPU.
+                JOBS[job_id]["stage"] = "freeing"
+            release_ollama_vram()
             with LOCK:
                 JOBS[job_id]["stage"] = "sampling"
-            graph = build_graph(final_prompt, spec["negative"], spec["resolution"],
+            graph = build_graph(final_prompt, "", spec["resolution"],
                                 spec["seed"], spec["profile"], spec["reference"],
                                 spec["model_id"])
             resp = comfy_post("/prompt", {"prompt": graph, "client_id": job_id})
@@ -995,7 +1101,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             resolution = int(body.get("resolution") or 1024)
-            seed = int(body.get("seed") or time.time_ns() % (2 ** 31))
+            # 0 is a real seed; only a missing value should be randomized.
+            raw_seed = body.get("seed")
+            if raw_seed is None or raw_seed == "":
+                seed = time.time_ns() % (2 ** 31)
+            else:
+                seed = int(raw_seed)
         except (TypeError, ValueError):
             self._send(400, {"error": "invalid generation option"})
             return
@@ -1058,6 +1169,9 @@ class Handler(BaseHTTPRequestHandler):
                 body, image_limit=CHAT_MAX_MODEL_IMAGES)
         except ValueError as e:
             self._send(400, {"error": str(e)})
+            return
+        if has_images and not known[model_id]["vision"]:
+            self._send(400, {"error": "โมเดลที่เลือกไม่รองรับรูปภาพ กรุณาเลือกโมเดลที่มีป้าย 'เห็นภาพ'"})
             return
         notes = pdf_notes + (notes or [])
         self._stream_chat(model_id, messages, notes)

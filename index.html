@@ -99,6 +99,8 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
 .msg .tok{display:inline-flex;align-items:center;margin:9px 0 0 8px;color:#8f8a8c;font-size:11px;font-variant-numeric:tabular-nums}
 .ctx-meter{display:flex;justify-content:flex-end;padding:5px 2px 0;color:#8f8a8c;font-size:11.5px;font-variant-numeric:tabular-nums}
 .ctx-meter.warn{color:#ffab7d}
+#chat-status{margin:8px 0 0}#chat-status.error{color:#ff8f88}
+#enhanced{white-space:pre-wrap;margin-top:8px}
 .msg .att{display:inline-flex;align-items:center;gap:6px;margin:5px 6px 0 0;padding:5px 9px;border-radius:8px;background:rgba(0,0,0,.25);font-size:12px}
 .msg .thumb{display:block;max-width:180px;max-height:140px;border-radius:9px;margin-top:8px;border:1px solid rgba(255,255,255,.25)}
 .msg .note{display:block;margin-top:7px;color:#ffd39d;font-size:12px}
@@ -142,7 +144,7 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
     <label for="prompt">คำบรรยายภาพ <span class="required" aria-hidden="true">*</span></label>
     <textarea id="prompt" name="prompt" required maxlength="4000" placeholder="เช่น แมวส้มใส่ชุดนักสืบนั่งอยู่บนหลังคายามค่ำ แสงโคมไฟสีอุ่น มองเห็นเมืองด้านหลัง"></textarea>
     <p class="hint">บอกตัวแบบ ตำแหน่งในภาพ ฉาก และแสงให้ชัด หากต้องการตัวหนังสือ ให้ใส่ข้อความในเครื่องหมายคำพูด</p>
-    <p class="hint" id="thai-hint" hidden>เขียนคำบรรยายเป็นภาษาไทยได้เลย ระบบจะแปลเป็นภาษาอังกฤษให้อัตโนมัติเพื่อให้ตรงใจโมเดลมากขึ้น ยกเว้นข้อความในเครื่องหมายคำพูด " " จะคงภาษาเดิมไว้ให้ปรากฏในภาพ</p>
+    <p class="hint" id="thai-hint" hidden>เขียนคำบรรยายเป็นภาษาไทยได้เลย ระบบจะแปลเป็นภาษาอังกฤษแล้วแสดงประโยคที่ส่งเข้าโมเดลให้ตรวจ ข้อความในเครื่องหมายคำพูด " " คงไว้ตามเดิม</p>
     <div class="examples"><span class="examples-title">ลองเริ่มจากตัวอย่าง</span><div class="chips">
       <button class="chip" type="button" data-prompt="ทุ่งดอกไม้สีแดงยามเช้า แสงอาทิตย์อ่อน ๆ ภูเขาไกล ๆ ภาพถ่ายสมจริง">ทิวทัศน์ธรรมชาติ</button>
       <button class="chip" type="button" data-prompt="แมวส้มสวมชุดนักบินอวกาศยืนบนดวงจันทร์ มองเห็นโลกอยู่ด้านหลัง ภาพประกอบรายละเอียดสูง">ตัวละครแฟนตาซี</button>
@@ -160,9 +162,9 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
     <fieldset id="profile-fieldset"><legend>ความเร็วในการสร้าง</legend><div class="sizes">
       <label class="size"><input type="radio" name="profile" value="fast"><span><strong>⚡ เร็ว</strong><small>~1 นาที ภาพทั่วไป</small></span></label>
       <label class="size"><input type="radio" name="profile" value="medium" checked><span><strong>⚖️ ปานกลาง</strong><small>~1-2 นาที สมดุล</small></span></label>
-      <label class="size"><input type="radio" name="profile" value="quality"><span><strong>✧ เน้นคุณภาพ</strong><small>~2-3 นาที ตรง/ละเอียด</small></span></label>
+      <label class="size"><input type="radio" name="profile" value="quality"><span><strong>✧ เน้นคุณภาพ</strong><small>25 สเต็ป ตรงคำบรรยายขึ้น</small></span></label>
     </div>
-    <p class="hint">ยิ่งเน้นคุณภาพ ภาพยิ่งคมและตรงคำบรรยาย แต่ใช้เวลานานขึ้น</p></fieldset>
+    <p class="hint">ทุกโหมดใช้ CFG 1.0 ตามสูตรของ Qwen-Image 2.1 โหมดคุณภาพเพิ่มจำนวนสเต็ป ไม่ได้เร่ง CFG</p></fieldset>
     <fieldset id="reference-fieldset"><legend>รูปอ้างอิงใบหน้า (ไม่บังคับ)</legend>
       <div class="ref-row">
         <img id="ref-preview" alt="รูปอ้างอิงที่เลือก">
@@ -174,9 +176,9 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
       <p class="hint">อัปโหลดรูปคนที่ต้องการเพื่อให้ภาพที่สร้างอ้างอิงใบหน้านั้น (ระบบจะลบรูปที่อัปโหลดหลังทำงานเสร็จ) — เมื่อใช้รูปอ้างอิง ขนาดภาพผลลัพธ์จะออกตามสัดส่วนของรูปอ้างอิง</p>
     </fieldset>
     <details id="negative-options"><summary>ตัวเลือกเพิ่มเติม</summary>
-      <label for="negative">สิ่งที่ไม่ต้องการให้มีในภาพ (ใช้ผลเฉพาะโหมดเน้นคุณภาพ)</label>
-      <input type="text" id="negative" name="negative" placeholder="เช่น watermark, blurry">
-      <p class="hint">โหมดเร็วและปานกลางใช้ CFG 1.0 จึงไม่นำ negative prompt มาคำนวณ</p>
+      <label for="negative">สิ่งที่ไม่ต้องการให้มีในภาพ</label>
+      <input type="text" id="negative" name="negative" placeholder="เช่น watermark, blurry, ตัวหนังสือ">
+      <p class="hint">ระบบเติมต่อท้ายคำบรรยายเป็นบรรทัด Avoid เพื่อให้โมเดลเห็นในทุกโหมด</p>
     </details>
     <button class="primary" id="btn" type="submit" disabled><span aria-hidden="true">✦</span> สร้างรูปภาพ</button>
     <p class="privacy">เวลาสร้างภาพขึ้นอยู่กับโมเดล ขนาดภาพ และคิวงาน · ระบบสุ่ม seed ใหม่ทุกครั้ง</p>
@@ -189,7 +191,7 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
     <div class="progress" id="progress"><div class="spinner" aria-hidden="true"></div><strong>กำลังสร้างภาพของคุณ</strong><p id="wait-note">ใช้เวลาประมาณ 2 นาที กรุณาเปิดหน้านี้ไว้</p><time id="elapsed" aria-hidden="true">00:00</time></div>
     <img id="result" alt="ภาพที่สร้างจากคำบรรยาย">
   </div>
-  <div class="result-footer"><p id="status" role="status" aria-live="polite">พร้อมสร้างภาพ</p><a id="download" href="#" download="thani-pitak-ai.png">↓ ดาวน์โหลด PNG</a></div>
+  <div class="result-footer"><p id="status" role="status" aria-live="polite">พร้อมสร้างภาพ</p><p class="hint" id="enhanced" hidden></p><a id="download" href="#" download="thani-pitak-ai.png">↓ ดาวน์โหลด PNG</a></div>
 </section>
 </div>
 </section>
@@ -208,6 +210,7 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
     </div>
     <div class="ctx-meter" id="ctx-meter" hidden>🧠 บริบท: –</div>
     <div class="chat-att" id="chat-att"></div>
+    <p class="hint" id="chat-status" role="status" aria-live="polite" hidden></p>
     <form id="chat-form" class="chat-form">
       <label class="attach-btn" for="chat-files" title="แนบไฟล์">📎<input type="file" id="chat-files" multiple accept=".pdf,.docx,.xlsx,.xlsm,.txt,.md,.csv,.json,.png,.jpg,.jpeg"></label>
       <textarea id="chat-input" rows="1" placeholder="พิมพ์คำถาม… (Enter ส่ง · Shift+Enter ขึ้นบรรทัดใหม่)"></textarea>
@@ -229,6 +232,8 @@ function downscaleToJpeg(file,maxSide){return new Promise((resolve,reject)=>{con
 function setReference(data){refData=data;if(data){$("ref-preview").src=data;$("ref-preview").style.display="block";$("ref-clear").style.display="inline-block"}else{$("ref-preview").style.display="none";$("ref-preview").removeAttribute("src");$("ref-clear").style.display="none";$("ref-input").value=""}}
 function show(name){$("empty").style.display=name==="empty"?"block":"none";$("progress").style.display=name==="progress"?"block":"none";$("result").style.display=name==="result"?"block":"none"}
 function setStatus(message,error=false){$("status").textContent=message;$("status").classList.toggle("error",error)}
+function showEnhanced(text){const el=$("enhanced");el.hidden=!text;el.textContent=text?"คำบรรยายที่ส่งเข้าโมเดล: "+text:""}
+function setChatStatus(message,error=false){const el=$("chat-status");el.hidden=!message;el.textContent=message||"";el.classList.toggle("error",!!error)}
 function stopClock(){if(clock)clearInterval(clock);clock=null}
 function updateClock(){const seconds=Math.floor((Date.now()-startedAt)/1000);$("elapsed").textContent=String(Math.floor(seconds/60)).padStart(2,"0")+":"+String(seconds%60).padStart(2,"0")}
 async function jsonResponse(response){const data=await response.json();if(!response.ok)throw new Error(data.error||"คำขอไม่สำเร็จ");return data}
@@ -239,7 +244,7 @@ function applyModel(){
   $("profile-fieldset").hidden=!hasSpeedProfiles(model);
   $("reference-fieldset").hidden=!model.supports_reference;
   $("negative-options").hidden=!model.supports_negative;
-  $("model-hint").textContent=model.id==="qwen-image-2.1"?"รองรับรูปอ้างอิงใบหน้า · negative prompt ใช้ผลในโหมดเน้นคุณภาพ":model.id==="flux.2-klein-4b"?"FLUX.2 [klein] ใช้การสร้างภาพ 4 ขั้นตอน · ยังไม่รองรับรูปอ้างอิงและ negative prompt ในเว็บนี้":"ตัวเลือกที่ใช้ได้ขึ้นอยู่กับความสามารถของโมเดล";
+  $("model-hint").textContent=model.id==="qwen-image-2.1"?"รองรับรูปอ้างอิงใบหน้า · สิ่งที่ไม่ต้องการจะถูกใส่ต่อท้ายคำบรรยาย":model.id==="flux.2-klein-4b"?"FLUX.2 [klein] ใช้การสร้างภาพ 4 ขั้นตอน · ยังไม่รองรับรูปอ้างอิงและ negative prompt ในเว็บนี้":"ตัวเลือกที่ใช้ได้ขึ้นอยู่กับความสามารถของโมเดล";
 }
 async function loadModels(){
   try{
@@ -260,20 +265,22 @@ async function generate(event){
   const prompt=$("prompt").value.trim();
   if(!prompt){setStatus("กรุณาพิมพ์คำบรรยายภาพ",true);$("prompt").focus();return}
   const model=selectedModel();if(!model||!model.available){setStatus("กรุณาเลือกโมเดลที่พร้อมใช้งาน",true);return}
-  $("btn").disabled=true;$("download").style.display="none";$("result").removeAttribute("src");show("progress");setStatus("กำลังส่งงานเข้าคิว…");
+  $("btn").disabled=true;$("download").style.display="none";$("result").removeAttribute("src");show("progress");showEnhanced("");setStatus("กำลังส่งงานเข้าคิว…");
   startedAt=Date.now();updateClock();clock=setInterval(updateClock,1000);
   try{
     const profile=hasSpeedProfiles(model)?form.elements.profile.value:model.default_profile;
     const job=await jsonResponse(await fetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt,model:model.id,negative:model.supports_negative?$("negative").value:"",profile,resolution:Number(form.elements.resolution.value),reference:model.supports_reference?(refData||undefined):undefined})}));
     if(!job.id)throw new Error("ระบบไม่ส่งหมายเลขงานกลับมา");
-    const waitText=model.id==="qwen-image-2.1"?({fast:"ประมาณ 1 นาที",medium:"ประมาณ 1-2 นาที",quality:"ประมาณ 2-3 นาที"}[job.profile]||"ประมาณ 1-2 นาที"):"อาจใช้เวลาหลายนาที";
+    const waitText=model.id==="qwen-image-2.1"?({fast:"ประมาณ 1 นาที",medium:"ประมาณ 1-2 นาที",quality:"ประมาณ 2 นาที"}[job.profile]||"ประมาณ 1-2 นาที"):"อาจใช้เวลาหลายนาที";
     const modeName={fast:"เร็ว",medium:"ปานกลาง",quality:"เน้นคุณภาพ",standard:"มาตรฐาน"}[job.profile]||job.profile;
     $("wait-note").textContent=(model.id==="qwen-image-2.1"?"ใช้เวลา":"งานใหม่หรือการสลับโมเดล")+waitText+" กรุณาเปิดหน้านี้ไว้";
     setStatus("รับงานแล้ว · "+model.label+" · โหมด"+modeName+(model.supports_reference&&refData?" · ใช้รูปอ้างอิงใบหน้า":""));
     while(true){
       await new Promise(resolve=>setTimeout(resolve,3000));
       const state=await jsonResponse(await fetch("/api/status/"+encodeURIComponent(job.id)));
+      if(state.prompt_enhanced)showEnhanced(state.prompt_enhanced);
       if(state.stage==="translating")setStatus("กำลังแปลคำบรรยายภาษาไทยเป็นภาษาอังกฤษ…");
+      else if(state.stage==="freeing")setStatus("กำลังคืนหน่วยความจำจากการสนทนา เพื่อให้การ์ดจอว่างสำหรับสร้างภาพ…");
       else if(state.queue_ahead>0)setStatus("กำลังรอคิว… มีงานก่อนหน้าอีก "+state.queue_ahead+" งาน");
       else if(state.status==="running")setStatus("กำลังสร้างภาพ…");
       if(state.status==="done"){
@@ -466,7 +473,10 @@ $("chat-form").addEventListener("submit",async event=>{
         if(chunk.user_content)userContent=chunk.user_content;
         if(chunk.beat)continue;
         if(chunk.notes)for(const n of chunk.notes)streamNotes.push(n);
-        if(chunk.stage)reply.textContent=chunk.stage==="freeing"?"กำลังปล่อยหน่วยความจำ GPU จาก ComfyUI…":"กำลังโหลดโมเดลเข้า GPU…";
+        if(chunk.stage){
+          const label=chunk.stage==="freeing"?"กำลังปล่อยหน่วยความจำ GPU จาก ComfyUI…":"กำลังโหลดโมเดลเข้า GPU…";
+          reply.innerHTML=notesHtml()+escHtml(label)+' <span class="cursor"></span>';
+        }
         if(chunk.delta){full+=chunk.delta;reply.innerHTML=notesHtml()+mdLite(full)+'<span class="cursor"></span>';$("chat-log").scrollTop=$("chat-log").scrollHeight}
         if(chunk.usage){lastUsage=chunk.usage;updateCtxMeter(lastUsage)}
         if(chunk.truncated)streamNotes.push("คำตอบถูกตัดเพราะเต็มขอบเขตความจำ — พิมพ์ \"ต่อ\" เพื่อให้เขียนต่อจากที่ค้างไว้");

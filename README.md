@@ -26,7 +26,7 @@ Qwen-Image เข้าใจคำบรรยายภาษาอังกฤ
 
 ### โปรไฟล์ความเร็ว
 
-ทุกโปรไฟล์ใช้ sampler `euler` + scheduler `simple` ตามสูตรทางการของ Qwen-Image: `fast` 12 steps CFG 1.0 · `medium` 20 steps CFG 1.0 · `quality` 20 steps CFG 2.5 (negative prompt มีผลเฉพาะโปรไฟล์นี้)
+ทุกโปรไฟล์ใช้ sampler `euler` + scheduler `simple` และ CFG 1.0 ตามสูตรของ Qwen-Image-2.1: `fast` 12 steps · `medium` 20 steps · `quality` 25 steps การดัน CFG เกิน 1 ทำให้ภาพเบลอและช้าขึ้น จึงไม่ใช้ สิ่งที่ไม่ต้องการถูกเติมต่อท้ายคำบรรยายเป็นบรรทัด `Avoid:` เพราะที่ CFG 1 ตัว sampler ไม่ได้คำนวณ negative conditioning
 
 เว็บเซิร์ฟเวอร์ควรรับการเชื่อมต่อจาก loopback เท่านั้นเมื่อยังไม่มีระบบยืนยันตัวตน หากต้องเปิดผ่านอินเทอร์เน็ต ให้วาง Cloudflare Access หรือระบบยืนยันตัวตนและ reverse proxy ไว้ด้านหน้า
 

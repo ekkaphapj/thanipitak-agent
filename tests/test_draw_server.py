@@ -21,14 +21,17 @@ class DrawGraphTest(unittest.TestCase):
         graph = draw_server.build_graph("portrait", "blur", 768, 123, "quality",
                                         "draw_refs/example.png")
         self.assertEqual(graph["1"]["class_type"], "UnetLoaderGGUF")
-        self.assertEqual(graph["4"]["inputs"]["steps"], 20)
-        self.assertEqual(graph["4"]["inputs"]["cfg"], 2.5)
+        self.assertEqual(graph["4"]["inputs"]["steps"], 25)
+        self.assertEqual(graph["4"]["inputs"]["cfg"], 1.0)
+        self.assertEqual(graph["3"]["inputs"]["prompt"], "portrait\nAvoid: blur")
+        self.assertEqual(graph["3"]["inputs"]["negative_prompt"], "")
         self.assertEqual(graph["3"]["inputs"]["images.image_1"], ["8", 0])
         self.assertEqual(graph["3"]["inputs"]["vae"], ["5", 0])
         fast = draw_server.build_graph("portrait", "", 768, 123, "fast")
         medium = draw_server.build_graph("portrait", "", 768, 123, "medium")
         self.assertEqual((fast["4"]["inputs"]["steps"], fast["4"]["inputs"]["cfg"]), (12, 1.0))
         self.assertEqual((medium["4"]["inputs"]["steps"], medium["4"]["inputs"]["cfg"]), (20, 1.0))
+        self.assertNotIn("Avoid:", fast["3"]["inputs"]["prompt"])
 
     def test_flux_uses_distilled_four_step_graph(self):
         graph = draw_server.build_graph("golfing puppy", "", 768, 123, "standard",
@@ -65,6 +68,42 @@ class EnhancePromptTest(unittest.TestCase):
         sent = json.loads(opener.call_args.args[0].data)
         self.assertEqual(sent["messages"][1]["content"], "แมวส้มอ่านหนังสือ")
         self.assertIn("double quotes", sent["messages"][0]["content"])
+        self.assertIn("ตัวหนังสือ", sent["messages"][0]["content"])
+        self.assertEqual(sent["temperature"], 0)
+
+    def test_rejects_translation_that_drops_quotes_or_lettering(self):
+        bad_quotes = {"choices": [{"message": {"content": "A sign that says hello"}}]}
+        bad_books = {"choices": [{"message": {"content":
+            "No actual books are visible in the image."}}]}
+        kept = {"choices": [{"message": {"content":
+            'One orange cat reading a book. No rendered text is visible. The sign reads "สวัสดี".'}}]}
+        with mock.patch.object(draw_server, "ENRICHER_URL", "http://127.0.0.1:1/v1/chat/completions"):
+            opener = mock.MagicMock()
+            opener.return_value.__enter__.return_value.read.side_effect = [
+                json.dumps(bad_quotes).encode(),
+                json.dumps(bad_books).encode(),
+                json.dumps(kept).encode(),
+            ]
+            with mock.patch.object(urllib.request, "urlopen", opener):
+                quoted = 'ป้ายเขียนว่า "สวัสดี"'
+                self.assertEqual(draw_server.enhance_prompt(quoted), quoted)
+                lettering = "แมวอ่านหนังสือ ไม่มีตัวหนังสือในภาพ"
+                self.assertEqual(draw_server.enhance_prompt(lettering), lettering)
+                good_source = 'แมวอ่านหนังสือ ไม่มีตัวหนังสือ ป้ายเขียนว่า "สวัสดี"'
+                self.assertIn("rendered text", draw_server.enhance_prompt(good_source))
+                self.assertIn('"สวัสดี"', draw_server.enhance_prompt(good_source))
+        self.assertEqual(opener.call_count, 3)
+
+    def test_rejects_translation_that_drops_the_avoid_line(self):
+        source = "แมวส้ม\nAvoid: watermark"
+        reply = {"choices": [{"message": {"content": "An orange cat sitting on a chair"}}]}
+        with mock.patch.object(draw_server, "ENRICHER_URL", "http://127.0.0.1:1/v1/chat/completions"):
+            opener = mock.MagicMock()
+            opener.return_value.__enter__.return_value.read.return_value = json.dumps(reply).encode()
+            with mock.patch.object(urllib.request, "urlopen", opener):
+                self.assertEqual(draw_server.enhance_prompt(source), source)
+                self.assertEqual(draw_server.enhance_prompt(source), source)
+        self.assertEqual(opener.call_count, 1)
 
     def test_enricher_failure_falls_back_to_original(self):
         with mock.patch.object(draw_server, "ENRICHER_URL", "http://127.0.0.1:1/v1/chat/completions"):
@@ -101,8 +140,10 @@ class RunJobTest(unittest.TestCase):
                 "seed": 5, "profile": "medium", "reference": None,
                 "model_id": draw_server.DEFAULT_MODEL_ID}
         draw_server.JOBS["job1"] = {"status": "queued", "ts": 0}
+        order = []
         with mock.patch.object(draw_server, "enhance_prompt", return_value="an orange cat reading a book"), \
-             mock.patch.object(draw_server, "comfy_post", side_effect=fake_post), \
+             mock.patch.object(draw_server, "release_ollama_vram", side_effect=lambda: order.append("release")), \
+             mock.patch.object(draw_server, "comfy_post", side_effect=lambda *a, **k: order.append("comfy") or fake_post(*a, **k)), \
              mock.patch.object(draw_server, "comfy_get", return_value=history), \
              mock.patch.object(draw_server.time, "sleep"):
             draw_server.run_job("job1", spec)
@@ -115,7 +156,9 @@ class RunJobTest(unittest.TestCase):
         self.assertEqual(draw_server.JOBS["job1"]["prompt_enhanced"],
                          "an orange cat reading a book")
         self.assertEqual(self.graph["3"]["inputs"]["prompt"], "an orange cat reading a book")
+        self.assertEqual(self.graph["3"]["inputs"]["negative_prompt"], "")
         self.assertEqual(self.graph["4"]["inputs"]["steps"], 20)
+        self.assertEqual(order, ["release", "comfy"])
 
     def test_comfy_error_marks_job_failed(self):
         draw_server.JOBS.clear()
@@ -123,7 +166,8 @@ class RunJobTest(unittest.TestCase):
         spec = {"prompt": "cat", "negative": "", "resolution": 512, "seed": 1,
                 "profile": "fast", "reference": None,
                 "model_id": draw_server.DEFAULT_MODEL_ID}
-        with mock.patch.object(draw_server, "comfy_post", side_effect=RuntimeError("comfy down")), \
+        with mock.patch.object(draw_server, "release_ollama_vram"), \
+             mock.patch.object(draw_server, "comfy_post", side_effect=RuntimeError("comfy down")), \
              mock.patch.object(draw_server.time, "sleep"):
             draw_server.run_job("job2", spec)
         self.assertEqual(draw_server.JOBS["job2"]["status"], "error")
@@ -188,6 +232,51 @@ class AttachmentExtractTest(unittest.TestCase):
         self.assertIn("=== ชีต: สรุป ===", text)
         self.assertIn("42\tTRUE", text)
 
+    def test_docx_decodes_xml_entities(self):
+        doc_xml = "<w:document><w:p>A &amp; B &lt;C&gt;</w:p></w:document>"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("word/document.xml", doc_xml)
+        text, err = draw_server.extract_attachment("a.docx", buf.getvalue())
+        self.assertIsNone(err)
+        self.assertIn("A & B <C>", text)
+
+    def test_xlsx_reads_inline_text_numbers_and_shared_cells(self):
+        sheet = """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="inlineStr"><is><t>ชื่อ</t></is></c>
+              <c r="B1"><v>42</v></c>
+              <c r="C1" t="s"><v>0</v></c>
+            </row>
+          </sheetData>
+        </worksheet>"""
+        book = """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <sheets><sheet name="ขาย" sheetId="1" r:id="rId1"/></sheets></workbook>"""
+        rels = """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Target="worksheets/sheet1.xml"/>
+        </Relationships>"""
+        shared = "<sst><si><t>จากตาราง</t></si></sst>"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("xl/worksheets/sheet1.xml", sheet)
+            z.writestr("xl/workbook.xml", book)
+            z.writestr("xl/_rels/workbook.xml.rels", rels)
+            z.writestr("xl/sharedStrings.xml", shared)
+        text, err = draw_server.extract_attachment("sales.xlsx", buf.getvalue())
+        self.assertIsNone(err)
+        self.assertIn("=== ชีต: ขาย ===", text)
+        self.assertIn("ชื่อ\t42\tจากตาราง", text)
+
+    def test_xlsx_without_cells_is_an_error(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("xl/workbook.xml", "<workbook/>")
+        text, err = draw_server.extract_attachment("empty.xlsx", buf.getvalue())
+        self.assertIsNone(text)
+        self.assertIn("Excel", err)
+
     def test_pdf_uncompressed_and_unreadable(self):
         pdf = b"BT (hello pdf text extractor) Tj ET"
         text, err = draw_server.extract_attachment("a.pdf", pdf)
@@ -223,6 +312,30 @@ class ChatMessageTest(unittest.TestCase):
         self.assertIn("ไฟล์แนบ report.txt", messages[-1]["content"])
         self.assertIn("quarterly numbers: 42", messages[-1]["content"])
 
+    def test_xlsx_without_shared_strings_does_not_crash(self):
+        sheet = """<worksheet><sheetData><row>
+          <c t="inlineStr"><is><t>เฉพาะในเซลล์</t></is></c><c><v>9</v></c>
+        </row></sheetData></worksheet>"""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("xl/worksheets/sheet1.xml", sheet)
+        payload = {"messages": [{"role": "user", "content": "",
+            "docs": [{"name": "n.xlsx",
+                      "data": base64.b64encode(buf.getvalue()).decode()}]}]}
+        messages, has_images, notes = draw_server.build_chat_messages(payload)
+        self.assertFalse(has_images)
+        self.assertEqual(notes, [])
+        self.assertIn("เฉพาะในเซลล์", messages[-1]["content"])
+        self.assertIn("9", messages[-1]["content"])
+
+        empty = io.BytesIO()
+        with zipfile.ZipFile(empty, "w") as z:
+            z.writestr("xl/workbook.xml", "<workbook/>")
+        payload["messages"][-1]["docs"][0]["data"] = base64.b64encode(empty.getvalue()).decode()
+        with self.assertRaises(ValueError) as error:
+            draw_server.build_chat_messages(payload)
+        self.assertIn("Excel", str(error.exception))
+
     def test_rejects_bad_history_and_limits(self):
         for messages in ([], "nope",
                          [{"role": "system", "content": "x"}],
@@ -249,6 +362,43 @@ class OllamaStream:
 
     def read(self):
         return b"".join(self.chunks)
+
+
+class ReleaseOllamaTest(unittest.TestCase):
+    def test_unloads_only_resident_models(self):
+        class Resp:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return self.payload
+
+        calls = []
+
+        def fake_urlopen(url, *a, **k):
+            target = url.full_url if isinstance(url, urllib.request.Request) else url
+            if str(target).endswith("/api/ps"):
+                body = {"models": [{"name": "typhoon2.5-4b"}, {"model": "qwen3:8b"},
+                                   {"name": "typhoon2.5-4b"}]}
+                return Resp(json.dumps(body).encode())
+            calls.append(json.loads(url.data.decode()))
+            return Resp(b'{"done": true, "done_reason": "unload"}')
+
+        with mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            draw_server.release_ollama_vram()
+        self.assertEqual([c["model"] for c in calls], ["typhoon2.5-4b", "qwen3:8b"])
+        self.assertTrue(all(c["keep_alive"] == 0 and c["prompt"] == "" and c["stream"] is False
+                            for c in calls))
+
+    def test_ollama_down_is_not_fatal(self):
+        with mock.patch.object(urllib.request, "urlopen", side_effect=OSError("down")):
+            draw_server.release_ollama_vram()
 
 
 class FreeComfyVramTest(unittest.TestCase):
@@ -356,6 +506,7 @@ class ChatHttpTest(unittest.TestCase):
         self.tags.start()
 
     def tearDown(self):
+        draw_server.CHAT_CAPABILITY_CACHE.clear()
         self.tags.stop()
         self.server.shutdown()
         self.server.server_close()
@@ -488,6 +639,80 @@ class ChatHttpTest(unittest.TestCase):
         self.assertIn("ไม่รองรับรูปภาพ",
                       json.loads(error.exception.read().decode("utf-8"))["error"])
         error.exception.close()
+
+    def test_upstream_error_is_forwarded_without_a_false_done(self):
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        chunks = [
+            {"message": {"content": "บางส่วน"}, "done": False},
+            {"error": "model failed during inference"},
+        ]
+        with self.ollama_mock(chunks), \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"):
+            with self.chat_post(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        self.assertEqual("".join(r.get("delta", "") for r in rows), "บางส่วน")
+        self.assertEqual(rows[-1]["error"], "model failed during inference")
+        self.assertFalse(any(r.get("done") for r in rows))
+
+    def test_content_on_the_done_chunk_is_kept(self):
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        chunks = [{"message": {"content": "ok"}, "done": True, "eval_count": 1}]
+        with self.ollama_mock(chunks), \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"):
+            with self.chat_post(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        self.assertEqual("".join(r.get("delta", "") for r in rows), "ok")
+        self.assertTrue(rows[-1]["done"])
+
+    def test_tags_without_capabilities_use_show_and_cache(self):
+        draw_server.CHAT_CAPABILITY_CACHE.clear()
+        tags = [{"model": "vl:4b"}, {"model": "emb"}]
+        shows = {"vl:4b": ["completion", "vision"], "emb": ["embedding"]}
+
+        class Resp:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return self.payload
+
+        def fake_urlopen(url, *args, **kwargs):
+            target = url.full_url if isinstance(url, urllib.request.Request) else url
+            self.assertTrue(str(target).endswith("/api/show"))
+            model_id = json.loads(url.data.decode())["model"]
+            return Resp(json.dumps({"capabilities": shows[model_id]}).encode())
+
+        with mock.patch.object(draw_server, "ollama_tags", return_value=tags), \
+             mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen) as show:
+            first = draw_server.chat_models()
+            second = draw_server.chat_models()
+        self.assertEqual([(m["id"], m["vision"]) for m in first["models"]], [("vl:4b", True)])
+        self.assertEqual(second, first)
+        self.assertEqual(show.call_count, 2)  # one show per model, then the cache
+        draw_server.CHAT_CAPABILITY_CACHE.clear()
+
+    def test_multipage_pdf_is_accepted_on_a_vision_model(self):
+        pages = ["QQ=="] * 6
+        body = {"model": "vl:4b", "messages": [{"role": "user", "content": "อ่าน",
+            "docs": [{"name": "a.pdf", "data": base64.b64encode(b"%PDF-1.4").decode()}]}]}
+        chunks = [{"message": {"content": "ok"}, "done": True}]
+        with mock.patch.object(draw_server, "pdf_page_images", return_value=pages), \
+             self.ollama_mock(chunks) as urlopen, \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"):
+            with self.chat_post(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(len(sent["messages"][-1]["images"]), 6)
+        self.assertTrue(rows[-1]["done"])
 
         body["model"] = "vl:4b"
         ok = [{"message": {"content": "ok"}, "done": True}]
@@ -761,6 +986,16 @@ class DrawHttpTest(unittest.TestCase):
                 data = json.load(response)
         comfy_get.assert_not_called()
         self.assertNotIn("queue_ahead", data)
+
+    def test_explicit_zero_seed_is_kept(self):
+        with mock.patch.object(draw_server, "run_job") as run_job:
+            with self.post(json.dumps({"prompt": "bird", "seed": 0}).encode()) as response:
+                self.assertEqual(response.status, 200)
+            for _ in range(50):
+                if run_job.called:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(run_job.call_args.args[1]["seed"], 0)
 
     def test_invalid_utf8_is_rejected(self):
         with self.assertRaises(urllib.error.HTTPError) as error:
