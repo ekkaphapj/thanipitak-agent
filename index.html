@@ -384,8 +384,16 @@ $("chat-log").addEventListener("click",async event=>{
   const text=isCode?btn.closest("pre").querySelector("code").textContent:btn._raw;
   if(text==null)return;
   const idle=isCode?"⧉ คัดลอง":"⧉ คัดลองข้อความ";
-  try{await navigator.clipboard.writeText(text);btn.textContent="✓ คัดลอกแล้ว"}
-  catch{btn.textContent="คัดลองไม่สำเร็จ (เบราว์เซอร์ไม่อนุญาต)"}
+  let ok=false;
+  try{await navigator.clipboard.writeText(text);ok=true}
+  catch{ // webviews/iframes without the async clipboard permission
+    const ta=document.createElement("textarea");
+    ta.value=text;ta.style.cssText="position:fixed;opacity:0";
+    document.body.appendChild(ta);ta.select();
+    try{ok=document.execCommand("copy")}catch{ok=false}
+    ta.remove();
+  }
+  btn.textContent=ok?"✓ คัดลอกแล้ว":"คัดลองไม่สำเร็จ (เบราว์เซอร์ไม่อนุญาต)";
   setTimeout(()=>{btn.textContent=idle},1600);
 });
 $("chat-form").addEventListener("submit",async event=>{
