@@ -527,7 +527,8 @@ def run_job(job_id, spec, ref_path=None):
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+    def _send(self, code, body, ctype="application/json; charset=utf-8",
+              cache=None):
         if isinstance(body, bytes):
             data = body
         elif isinstance(body, str):
@@ -537,6 +538,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        if cache:
+            self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(data)
 
@@ -624,7 +627,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             html = (HERE / "index.html").read_text(encoding="utf-8")
-            self._send(200, html, "text/html; charset=utf-8")
+            self._send(200, html, "text/html; charset=utf-8", cache="no-cache")
         elif self.path == "/api/health":
             self._send(200, {"ok": True, "model": MODEL,
                              "available_models": [m["id"] for m in model_catalog()["models"]
