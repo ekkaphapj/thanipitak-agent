@@ -47,6 +47,8 @@ CHAT_MAX_IMAGES = 4
 CHAT_MAX_DOCS = 4
 CHAT_TIMEOUT = 600
 CHAT_HEARTBEAT = 15  # seconds between keepalive lines while Ollama is silent
+CHAT_KEEP_ALIVE = os.environ.get("CHAT_KEEP_ALIVE", "30m")
+WARMUP_TIMEOUT = 300
 DEFAULT_MODEL_ID = "qwen-image-2.1"
 FLUX_MODEL_ID = "flux.2-klein-4b"
 RESOLUTIONS = [512, 640, 768, 896, 1024]
@@ -302,6 +304,32 @@ def extract_attachment(name, data):
     return None, "ชนิดไฟล์นี้ยังไม่รองรับ"
 
 
+def free_comfy_vram():
+    """Unload ComfyUI's models so Ollama can own the whole GPU.
+
+    Never touches anything while a generation is executing. Returns True when
+    ComfyUI was asked to free memory.
+    """
+    try:
+        queue = comfy_get("/queue")
+        if queue.get("queue_running"):
+            return False
+        comfy_post("/free", {"unload_models": True, "free_memory": True})
+        return True
+    except Exception:
+        return False
+
+
+def warm_chat_model(model_id):
+    """Load a chat model into VRAM without generating anything."""
+    payload = {"model": model_id, "keep_alive": CHAT_KEEP_ALIVE}
+    req = urllib.request.Request(
+        OLLAMA + "/api/generate", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=WARMUP_TIMEOUT) as r:
+        r.read()
+
+
 def build_chat_messages(payload):
     """Validate a chat request and turn it into Ollama messages.
 
@@ -513,7 +541,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stream_chat(self, model_id, messages, notes):
         payload = {"model": model_id, "messages": messages,
-                   "stream": True, "think": False}
+                   "stream": True, "think": False,
+                   "keep_alive": CHAT_KEEP_ALIVE}
         req = urllib.request.Request(
             OLLAMA + "/api/chat", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
@@ -547,6 +576,13 @@ class Handler(BaseHTTPRequestHandler):
                         return
 
         threading.Thread(target=heartbeat, daemon=True).start()
+        try:
+            emit({"stage": "freeing"})
+            free_comfy_vram()
+            emit({"stage": "loading"})
+            warm_chat_model(model_id)
+        except Exception as e:  # prep failed — the chat call may still load it
+            emit({"notes": [f"เตรียม GPU ไม่สำเร็จ ({str(e)[:120]}) ลองตอบต่อแบบช้า"]})
         try:
             with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as r:
                 for line in r:

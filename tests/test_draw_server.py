@@ -214,6 +214,41 @@ class OllamaStream:
     def __iter__(self):
         return iter(self.chunks)
 
+    def read(self):
+        return b"".join(self.chunks)
+
+
+class FreeComfyVramTest(unittest.TestCase):
+    def test_frees_only_when_idle(self):
+        with mock.patch.object(draw_server, "comfy_get",
+                               return_value={"queue_running": [[1, "x"]]}), \
+             mock.patch.object(draw_server, "comfy_post") as post:
+            self.assertFalse(draw_server.free_comfy_vram())
+            post.assert_not_called()
+
+        with mock.patch.object(draw_server, "comfy_get",
+                               return_value={"queue_running": []}), \
+             mock.patch.object(draw_server, "comfy_post") as post:
+            self.assertTrue(draw_server.free_comfy_vram())
+            post.assert_called_with("/free", {"unload_models": True,
+                                             "free_memory": True})
+
+    def test_comfy_down_is_not_fatal(self):
+        with mock.patch.object(draw_server, "comfy_get", side_effect=OSError):
+            self.assertFalse(draw_server.free_comfy_vram())
+
+
+class WarmModelTest(unittest.TestCase):
+    def test_warmup_loads_model_with_keep_alive(self):
+        stream = OllamaStream([{"done": True}])
+        with mock.patch.object(urllib.request, "urlopen",
+                               return_value=stream) as urlopen:
+            draw_server.warm_chat_model("typhoon2.5-4b")
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["model"], "typhoon2.5-4b")
+        self.assertEqual(sent["keep_alive"], draw_server.CHAT_KEEP_ALIVE)
+        self.assertNotIn("prompt", sent)
+
 
 class ChatHttpTest(unittest.TestCase):
     def setUp(self):
@@ -267,14 +302,21 @@ class ChatHttpTest(unittest.TestCase):
         body = {"model": "qwen3:8b", "messages": [
             {"role": "user", "content": "hi",
              "docs": [{"name": "n.txt", "data": base64.b64encode(b"payload").decode()}]}]}
-        with self.ollama_mock(lines) as urlopen:
+        with self.ollama_mock(lines) as urlopen, \
+             mock.patch.object(draw_server, "free_comfy_vram", return_value=True) as free, \
+             mock.patch.object(draw_server, "warm_chat_model") as warm:
             with self.chat_post(body) as response:
                 streamed = response.read().decode()
         sent = json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(sent["model"], "qwen3:8b")
         self.assertEqual(sent["stream"], True)
+        self.assertEqual(sent["keep_alive"], draw_server.CHAT_KEEP_ALIVE)
         self.assertIn("payload", sent["messages"][-1]["content"])
+        free.assert_called_once()
+        warm.assert_called_once_with("qwen3:8b")
         rows = [json.loads(l) for l in streamed.splitlines() if l.strip()]
+        stages = [r["stage"] for r in rows if "stage" in r]
+        self.assertEqual(stages, ["freeing", "loading"])
         self.assertEqual(rows[0]["user_content"], sent["messages"][-1]["content"])
         self.assertEqual("".join(r["delta"] for r in rows if "delta" in r), "สวัสดี ครับ")
         self.assertTrue(rows[-1]["done"])
@@ -301,6 +343,8 @@ class ChatHttpTest(unittest.TestCase):
 
         body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
         with mock.patch.object(draw_server, "CHAT_HEARTBEAT", 0.05), \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"), \
              mock.patch.object(urllib.request, "urlopen", side_effect=selective):
             with self.chat_post(body) as response:
                 rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
@@ -319,7 +363,9 @@ class ChatHttpTest(unittest.TestCase):
 
         body["model"] = "vl:4b"
         ok = [{"message": {"content": "ok"}, "done": True}]
-        with self.ollama_mock(ok):
+        with self.ollama_mock(ok), \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"):
             with self.chat_post(body) as response:
                 self.assertTrue(json.loads(response.read().decode().splitlines()[-1])["done"])
 
