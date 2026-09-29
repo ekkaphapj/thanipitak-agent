@@ -64,7 +64,7 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
 @keyframes spin{to{transform:rotate(360deg)}}.progress strong{display:block;margin-bottom:7px}.progress p{margin:0;color:#aaa5a7;font-size:13px;line-height:1.6}
 .progress time{display:block;margin-top:14px;color:#f1aaa5;font-size:24px;font-variant-numeric:tabular-nums}
 .result-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;min-height:49px;padding-top:17px}
-#status{margin:0;color:#bcb6b8;font-size:13px;line-height:1.5}#status.error{color:#ff8f88}
+#status{margin:0;color:#bcb6b8;font-size:13px;line-height:1.5}#status.error,#chat-status.error{color:#ff8f88}
 #download{display:none;flex:none;padding:9px 12px;border:1px solid #89504d;border-radius:9px;color:#ffd8d4;font-size:13px;font-weight:700;text-decoration:none}
 #download:hover{background:#3b2929}
 .footer{display:flex;justify-content:space-between;gap:16px;padding-top:22px;color:#8e898b;font-size:12px;line-height:1.5}
@@ -209,11 +209,12 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
     <div class="ctx-meter" id="ctx-meter" hidden>🧠 บริบท: –</div>
     <div class="chat-att" id="chat-att"></div>
     <form id="chat-form" class="chat-form">
-      <label class="attach-btn" for="chat-files" title="แนบไฟล์">📎<input type="file" id="chat-files" multiple accept=".pdf,.docx,.xlsx,.txt,.md,.csv,.json,.png,.jpg,.jpeg"></label>
+      <label class="attach-btn" for="chat-files" title="แนบไฟล์">📎<input type="file" id="chat-files" multiple accept=".pdf,.docx,.xlsx,.xlsm,.txt,.md,.csv,.json,.png,.jpg,.jpeg"></label>
       <textarea id="chat-input" rows="1" placeholder="พิมพ์คำถาม… (Enter ส่ง · Shift+Enter ขึ้นบรรทัดใหม่)"></textarea>
       <button class="send-btn" id="chat-send" type="submit">ส่ง ➤</button>
       <button class="stop-btn" id="chat-stop" type="button" style="display:none">■ หยุด</button>
     </form>
+    <p id="chat-status" class="hint" role="status" aria-live="polite" hidden></p>
     <p class="hint" style="margin-top:9px">แนบได้ทั้งเอกสาร (PDF, DOCX, XLSX, TXT สูงสุด 4 ไฟล์ ไฟล์ละ 10MB) และรูปภาพ (PNG, JPG สูงสุด 4 รูป) — รูปภาพต้องเลือกโมเดลที่มีป้าย "เห็นภาพ" · <strong>วาง screenshot จากคลิปบอร์ดได้เลย (Ctrl+V)</strong></p>
   </section>
 </section>
@@ -338,11 +339,13 @@ function renderAtts(){
   }
 }
 function readAsDataURL(file){return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(new Error("อ่านไฟล์ไม่สำเร็จ"));r.readAsDataURL(file)})}
+function setChatStatus(message,error=false){const status=$("chat-status");status.textContent=message;status.hidden=!message;status.classList.toggle("error",error)}
 async function addChatFiles(files){
+  setChatStatus("");
   for(const file of files){
     const isImage=file.type.startsWith("image/");
-    if(isImage&&chatAtts.filter(a=>a.kind==="image").length>=4){setStatus("แนบรูปได้สูงสุด 4 รูป",true);continue}
-    if(!isImage&&chatAtts.filter(a=>a.kind!=="image").length>=4){setStatus("แนบเอกสารได้สูงสุด 4 ไฟล์",true);continue}
+    if(isImage&&chatAtts.filter(a=>a.kind==="image").length>=4){setChatStatus("แนบรูปได้สูงสุด 4 รูป",true);continue}
+    if(!isImage&&chatAtts.filter(a=>a.kind!=="image").length>=4){setChatStatus("แนบเอกสารได้สูงสุด 4 ไฟล์",true);continue}
     try{
       if(isImage){
         if(file.size>15*1024*1024)throw new Error("รูปใหญ่เกิน 15MB");
@@ -352,7 +355,7 @@ async function addChatFiles(files){
         const dataUrl=await readAsDataURL(file);
         chatAtts.push({kind:"doc",name:file.name||"เอกสาร",data:dataUrl.split(",",2)[1]});
       }
-    }catch(err){setStatus(file.name+": "+err.message,true)}
+    }catch(err){setChatStatus(file.name+": "+err.message,true)}
   }
   renderAtts();
 }
@@ -426,8 +429,9 @@ $("chat-form").addEventListener("submit",async event=>{
   if(chatBusy)return;
   const input=$("chat-input"),text=input.value.trim();
   const model=$("chat-model").value;
-  if(!model){setStatus("โมเดลยังไม่พร้อม ลองกดแท็บสนทนาใหม่อีกครั้ง",true);return}
+  if(!model){setChatStatus("โมเดลยังไม่พร้อม ลองกดแท็บสนทนาใหม่อีกครั้ง",true);return}
   if(!text&&!chatAtts.length)return;
+  setChatStatus("");
   const images=chatAtts.filter(a=>a.kind==="image").map(a=>a.dataUrl);
   const docs=chatAtts.filter(a=>a.kind!=="image").map(a=>({name:a.name,data:a.data}));
   const bubble=addBubble("user");
@@ -476,8 +480,8 @@ $("chat-form").addEventListener("submit",async event=>{
       }
     }
   }catch(error){
-    if(error.name==="AbortError"){reply.innerHTML=mdLite(full)+(full?"\n\n":"")+'<span class="note">⏹ หยุดตอบตามที่สั่ง</span>';if(full)chatHistory.push({role:"user",content:userContent||text||"(ดูไฟล์แนบ)"},{role:"assistant",content:full})}
-    else{reply.classList.add("error");reply.textContent="ตอบไม่สำเร็จ: "+error.message}
+    if(error.name==="AbortError"){reply.innerHTML=notesHtml()+mdLite(full)+(full?"\n\n":"")+'<span class="note">⏹ หยุดตอบตามที่สั่ง</span>';if(full)chatHistory.push({role:"user",content:userContent||text||"(ดูไฟล์แนบ)"},{role:"assistant",content:full})}
+    else{reply.classList.add("error");reply.innerHTML=notesHtml()+mdLite(full);const status=document.createElement("span");status.className="note";status.textContent="ตอบไม่สำเร็จ: "+error.message;reply.appendChild(status)}
   }finally{
     chatBusy=false;$("chat-send").disabled=false;$("chat-stop").style.display="none";
     $("chat-log").scrollTop=$("chat-log").scrollHeight;

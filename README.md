@@ -59,9 +59,30 @@ Qwen-Image เข้าใจคำบรรยายภาษาอังกฤ
 แท็บ "สนทนา AI" คุยกับโมเดล local ผ่าน Ollama (ค่าเริ่มต้น `http://127.0.0.1:11434` ปรับด้วย `OLLAMA_URL`):
 
 - `GET /api/chat/models` — โมเดลที่คุยได้ (กรอง embedding ออก) พร้อมป้ายว่ารองรับรูปภาพหรือไม่
-- `POST /api/chat` — ส่งประวัติบทสนทนา `{model, messages}` รับคำตอบแบบสตรรีม NDJSON (บรรทัดละ JSON: `user_content`, `notes`, `delta`, `done`, `error`)
+- `POST /api/chat` — ส่งประวัติบทสนทนา `{model, messages}` รับคำตอบแบบสตรีม NDJSON (บรรทัดละ JSON: `user_content`, `notes`, `stage`, `beat`, `delta`, `usage`, `truncated`, `done`, `error`) ถ้าโหลดโมเดลหรือสตรีมล้มเหลวจะส่ง `error` แล้วปิดสตรีม โดยไม่ส่ง `done` ว่าสำเร็จ
 
-ข้อความล่าสุดแนบไฟล์ได้: `images` (base64, สูงสุด 4 รูป — ต้องใช้โมเดลที่รองรับภาพ) และ `docs` (base64 ของ pdf/docx/xlsx/txt/csv/json/md สูงสุด 4 ไฟล์ ไฟล์ละ 10MB) — เซิร์ฟเวอร์สกัดข้อความจากไฟล์ด้วย stdlib (PDF เป็นแบบ best-effort: ฟอนต์ฝังแบบพิเศษเช่นไทยจำนวนมากอ่านไม่ออก ระบบจะแจ้งให้แนบเป็น .txt แทน) แล้วใส่ไว้ในบริบทของบทสนทนาต่อไป
+ข้อความล่าสุดแนบไฟล์ได้: `images` (base64, สูงสุด 4 รูป — ต้องใช้โมเดลที่รองรับภาพ) และ `docs` (base64 ของ pdf/docx/xlsx/xlsm/txt/csv/json/md สูงสุด 4 ไฟล์ ไฟล์ละ 10MB) ส่งไฟล์แนบโดยไม่พิมพ์คำถามได้ และวาง screenshot ด้วย Ctrl+V ในแท็บแชตได้
+
+PDF ใช้ Poppler: โมเดล vision จะอ่านภาพหน้าของ PDF สูงสุด 6 หน้าแรกต่อไฟล์ โดยภาพที่แนบและหน้า PDF รวมกันส่งได้สูงสุด 8 รูปต่อคำขอ ถ้าพื้นที่รูปไม่พอจะแจ้งจำนวนหน้าที่ไม่ได้ส่ง หรือพยายามสกัดเป็นข้อความแทน โมเดลข้อความใช้ `pdftotext -layout` ก่อนลอง parser แบบพื้นฐาน หากไฟล์อ่านไม่ได้จะส่งคำอธิบายกลับให้ผู้ใช้
+
+ติดตั้ง `poppler-utils` บน Debian/Ubuntu (`sudo apt install poppler-utils`) หรือเพิ่มโฟลเดอร์ `bin` ของ Poppler ลง PATH บน Windows ให้ service เรียก `pdftoppm` และ `pdftotext` ได้ Excel อ่านค่าเซลล์เป็นตารางพร้อมชื่อชีต แต่ไม่ได้คำนวณสูตรใหม่หรือแปลงรูปแบบวันที่จาก styles
+
+| Environment variable | ค่าเริ่มต้น | หน้าที่ |
+|---|---|---|
+| `CHAT_NUM_CTX` | `32768` | context ของ runner ทั้งตอน warm up และตอบ |
+| `CHAT_KEEP_ALIVE` | `30m` | เวลาค้างโมเดลใน Ollama |
+| `CHAT_PDF_PAGES` | `6` | จำนวนหน้าแรกของ PDF ที่แปลงเป็นรูปต่อไฟล์ |
+| `CHAT_SHEET_ROWS` | `400` | จำนวนแถวที่มีข้อมูลสูงสุดต่อชีต |
+
+ค่าจำนวน context/หน้า/แถวต้องเป็นจำนวนเต็มบวก ปรับ context ให้เหมาะกับ VRAM และตรวจ runner จริงด้วย `ollama ps` เซิร์ฟเวอร์ข้าม warm up เฉพาะเมื่อชื่อโมเดล, context และสัดส่วน VRAM ผ่านเงื่อนไขที่กำหนด
+
+### ตรวจการแก้ไข
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+ชุดทดสอบครอบคลุม HTTP chat สำหรับ PDF 6 หน้า, PDF อย่างเดียว, warm up ล้มเหลว, error ระหว่างสตรีม, การเชื่อมต่อจบก่อน `done` และ Excel ที่อ่านไม่ได้ โดยจำลอง Ollama/Poppler จึงไม่ได้ใช้ GPU
 
 ## ติดตั้งเป็น systemd service
 

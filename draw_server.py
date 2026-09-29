@@ -48,6 +48,7 @@ OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 CHAT_MAX_BODY = 40 * 1024 * 1024
 CHAT_MAX_FILE = 10 * 1024 * 1024
 CHAT_MAX_IMAGES = 4
+CHAT_MAX_MODEL_IMAGES = 8  # user images plus rendered PDF pages
 CHAT_MAX_DOCS = 4
 CHAT_TIMEOUT = 600
 CHAT_HEARTBEAT = 15  # seconds between keepalive lines while Ollama is silent
@@ -94,6 +95,7 @@ LOCK = threading.Lock()
 HERE = Path(__file__).resolve().parent
 PROMPT_CACHE = {}
 PROMPT_CACHE_MAX = 256
+CHAT_CAPABILITY_CACHE = {}
 
 ENHANCER_SYSTEM = (
     "You translate Thai image-generation prompts into vivid English prompts for a "
@@ -232,6 +234,26 @@ def chat_models():
     models = []
     for m in ollama_tags():
         caps = m.get("capabilities") or []
+        if not caps:
+            key = (OLLAMA, m["model"], m.get("digest"), m.get("modified_at"))
+            with LOCK:
+                cached = CHAT_CAPABILITY_CACHE.get(key)
+            if cached and time.monotonic() - cached[0] < 300:
+                caps = cached[1]
+            else:
+                try:
+                    req = urllib.request.Request(
+                        OLLAMA + "/api/show",
+                        data=json.dumps({"model": m["model"]}).encode(),
+                        headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        caps = json.loads(r.read().decode()).get("capabilities") or []
+                    with LOCK:
+                        if len(CHAT_CAPABILITY_CACHE) >= 256:
+                            CHAT_CAPABILITY_CACHE.clear()
+                        CHAT_CAPABILITY_CACHE[key] = (time.monotonic(), caps)
+                except Exception:
+                    caps = []  # allow text chat when capability discovery fails
         if caps and "completion" not in caps:  # embeddings etc.
             continue
         models.append({"id": m["model"], "label": m["model"],
@@ -444,27 +466,39 @@ def preprocess_pdf_docs(body, vision):
     docs = last.get("docs") or []
     if not docs:
         return []
-    images = last.setdefault("images", [])
+    images = last.get("images") or []
+    last["images"] = images
     notes = []
     for doc in list(docs):
         name = str(doc.get("name", "file"))
         if not name.lower().endswith(".pdf"):
             continue
+        if isinstance(doc.get("text"), str):
+            continue
         try:
             data = base64.b64decode(doc.get("data") or "", validate=False)
         except (binascii.Error, ValueError):
             continue  # build_chat_messages will report the broken file
-        if vision:
+        if len(data) > CHAT_MAX_FILE:
+            continue  # reject before spawning poppler; report during extraction
+        room = max(0, CHAT_MAX_MODEL_IMAGES - len(images))
+        if vision and room:
             pages = pdf_page_images(data, PDF_PAGES_MAX)
             if pages:
-                room = max(0, 8 - len(images))
                 take = pages[:room]
                 if take:
                     images.extend(take)
                     docs.remove(doc)
                     notes.append(f"{name}: แปลงเป็นภาพ {len(take)} หน้า "
                                  f"ให้โมเดลอ่านจากรูปโดยตรง")
+                    if len(take) < len(pages):
+                        notes.append(f"{name}: ไม่ได้ส่งอีก {len(pages) - len(take)} หน้า "
+                                     f"เพราะส่งภาพรวมได้สูงสุด {CHAT_MAX_MODEL_IMAGES} รูป")
+                    if len(pages) >= PDF_PAGES_MAX:
+                        notes.append(f"{name}: อ่านเป็นภาพสูงสุด {PDF_PAGES_MAX} หน้าแรก")
                     continue
+        elif vision:
+            notes.append(f"{name}: พื้นที่รูปเต็มแล้ว ลองอ่าน PDF เป็นข้อความแทน")
         text = pdf_text_via_poppler(data)
         if len(text.strip()) >= 20:
             doc.pop("data", None)
@@ -481,7 +515,10 @@ def extract_attachment(name, data):
         if ext in ("docx",):
             return extract_docx(data), None
         if ext in ("xlsx", "xlsm"):
-            return extract_xlsx(data) or None, None
+            text = extract_xlsx(data)
+            if not text.strip():
+                return None, "ไม่พบตารางที่อ่านได้ในไฟล์ Excel นี้"
+            return text, None
         if ext in ("pdf",):
             text = extract_pdf(data)
             if len(text) < 20:
@@ -516,7 +553,8 @@ def chat_model_ready(model_id):
         for m in models:
             if model_id in (m.get("name"), m.get("model")):
                 total = m.get("size") or 1
-                return (m.get("size_vram") or 0) >= 0.5 * total
+                return (m.get("context_length") == CHAT_NUM_CTX
+                        and (m.get("size_vram") or 0) >= 0.5 * total)
     except Exception:
         pass
     return False
@@ -532,36 +570,57 @@ def warm_chat_model(model_id):
         OLLAMA + "/api/generate", data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=WARMUP_TIMEOUT) as r:
-        r.read()
+        for line in r.read().splitlines():
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "error" in chunk:
+                raise RuntimeError(str(chunk["error"]))
 
 
-def build_chat_messages(payload):
-    """Validate a chat request and turn it into Ollama messages.
-
-    History entries pass through as {role, content}; the final user entry may
-    carry images (base64) and doc attachments whose extracted text is inlined
-    into the content so it stays in context for later turns.
-    """
+def validate_chat_payload(payload, image_limit=CHAT_MAX_IMAGES):
+    """Check request structure before any file conversion or extraction."""
+    if not isinstance(payload, dict):
+        raise ValueError("invalid chat request")
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages or len(messages) > 80:
         raise ValueError("invalid message history")
-    out = []
     for m in messages[:-1]:
         if (not isinstance(m, dict) or m.get("role") not in ("user", "assistant")
                 or not isinstance(m.get("content"), str)):
             raise ValueError("invalid message history")
-        out.append({"role": m["role"], "content": m["content"]})
     last = messages[-1]
     if not isinstance(last, dict) or last.get("role") != "user" \
             or not isinstance(last.get("content"), str):
         raise ValueError("invalid message history")
+    images = last.get("images")
+    docs = last.get("docs")
+    images = [] if images is None else images
+    docs = [] if docs is None else docs
+    if not isinstance(images, list) or len(images) > image_limit:
+        raise ValueError(f"too many images (max {image_limit})")
+    if not isinstance(docs, list) or len(docs) > CHAT_MAX_DOCS:
+        raise ValueError(f"too many documents (max {CHAT_MAX_DOCS})")
+    if any(not isinstance(img, str) for img in images):
+        raise ValueError("invalid image")
+    for doc in docs:
+        if not isinstance(doc, dict) or not (
+                isinstance(doc.get("data"), str) or isinstance(doc.get("text"), str)):
+            raise ValueError("invalid attachment")
+    if not last["content"].strip() and not docs and not images:
+        raise ValueError("message is empty")
+    return messages
+
+
+def build_chat_messages(payload, image_limit=CHAT_MAX_IMAGES):
+    """Extract attachments after validation and inline document context."""
+    messages = validate_chat_payload(payload, image_limit)
+    out = [{"role": m["role"], "content": m["content"]} for m in messages[:-1]]
+    last = messages[-1]
     content = last["content"].strip()
     images = last.get("images") or []
     docs = last.get("docs") or []
-    if not isinstance(images, list) or len(images) > CHAT_MAX_IMAGES:
-        raise ValueError(f"too many images (max {CHAT_MAX_IMAGES})")
-    if not isinstance(docs, list) or len(docs) > CHAT_MAX_DOCS:
-        raise ValueError(f"too many documents (max {CHAT_MAX_DOCS})")
     blocks, errors = [], []
     for doc in docs:
         if not isinstance(doc, dict):
@@ -580,9 +639,11 @@ def build_chat_messages(payload):
         text, err = extract_attachment(str(doc.get("name", "file")), data)
         if err:
             errors.append(f"{doc.get('name', '?')}: {err}"); continue
+        if not isinstance(text, str) or not text.strip():
+            errors.append(f"{doc.get('name', '?')}: ไม่พบข้อความที่อ่านได้"); continue
         blocks.append(f"ไฟล์แนบ {doc.get('name')}:\n{text[:60000]}")
     if not content and not blocks and not images:
-        raise ValueError("message is empty")
+        raise ValueError("; ".join(errors) if errors else "message is empty")
     if blocks:
         content = (content + "\n\n" if content else "") + "\n\n".join(blocks)
     msg = {"role": "user", "content": content or "(ดูรูปภาพที่แนบมา)"}
@@ -767,48 +828,58 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         wlock = threading.Lock()
-        state = {"done": False}
+        stopped = threading.Event()
 
         def emit(obj):
             with wlock:
+                if obj.get("beat") and stopped.is_set():
+                    return
                 self.wfile.write(json.dumps(obj, ensure_ascii=False).encode() + b"\n")
                 self.wfile.flush()
-
-        if notes:
-            emit({"notes": notes})
-        # exact user content (docs inlined) so the browser history matches
-        # what the model saw and follow-up questions keep the file context
-        emit({"user_content": messages[-1]["content"]})
+                if obj.get("done") or "error" in obj:
+                    stopped.set()
 
         def heartbeat():
             # Cloudflare and middleboxes drop connections that sit silent
             # while Ollama cold-loads a model (up to minutes on this GPU)
-            while not state["done"]:
-                time.sleep(CHAT_HEARTBEAT)
-                if not state["done"]:
-                    try:
-                        emit({"beat": True})
-                    except OSError:
-                        return
+            while not stopped.wait(CHAT_HEARTBEAT):
+                try:
+                    emit({"beat": True})
+                except OSError:
+                    stopped.set()
+                    return
 
-        threading.Thread(target=heartbeat, daemon=True).start()
-        if not chat_model_ready(model_id):
-            emit({"stage": "freeing"})
-            free_comfy_vram()
-            emit({"stage": "loading"})
-            warm_chat_model(model_id)
+        heartbeat_thread = threading.Thread(target=heartbeat, daemon=True,
+                                             name="chat-heartbeat")
+        heartbeat_thread.start()
         try:
+            if notes:
+                emit({"notes": notes})
+            # Keep browser document context identical to what Ollama sees.
+            emit({"user_content": messages[-1]["content"]})
+            if not chat_model_ready(model_id):
+                emit({"stage": "freeing"})
+                free_comfy_vram()
+                emit({"stage": "loading"})
+                warm_chat_model(model_id)
+            if stopped.is_set():
+                return
             with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as r:
                 for line in r:
+                    if stopped.is_set():
+                        return
                     if not line.strip():
                         continue
                     try:
                         chunk = json.loads(line.decode("utf-8", "replace"))
                     except json.JSONDecodeError:
                         continue
+                    if "error" in chunk:
+                        raise RuntimeError(str(chunk["error"]))
                     delta = chunk.get("message", {}).get("content", "")
+                    if delta:
+                        emit({"delta": delta})
                     if chunk.get("done"):
-                        state["done"] = True
                         usage = {"ctx": CHAT_NUM_CTX}
                         if isinstance(chunk.get("prompt_eval_count"), int):
                             usage["prompt"] = chunk["prompt_eval_count"]
@@ -820,16 +891,17 @@ class Handler(BaseHTTPRequestHandler):
                             emit({"truncated": True})
                         emit({"done": True})
                         return
-                    if delta:
-                        emit({"delta": delta})
-            state["done"] = True
-            emit({"done": True})
+            raise RuntimeError("Ollama ปิดการเชื่อมต่อก่อนตอบเสร็จ กรุณาลองอีกครั้ง")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # the browser disconnected; there is nowhere to send an error
         except Exception as e:  # tell the browser instead of dying mid-stream
-            state["done"] = True
             try:
                 emit({"error": str(e)[:300]})
             except OSError:
                 pass
+        finally:
+            stopped.set()
+            heartbeat_thread.join(timeout=1)
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
@@ -970,16 +1042,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "ไม่พบโมเดลนี้"})
             return
         try:
-            messages, has_images, notes = build_chat_messages(body)
+            raw_messages = validate_chat_payload(body)
         except ValueError as e:
             self._send(400, {"error": str(e)})
             return
-        if has_images and not known[model_id]["vision"]:
+        if raw_messages[-1].get("images") and not known[model_id]["vision"]:
             self._send(400, {"error": "โมเดลที่เลือกไม่รองรับรูปภาพ กรุณาเลือกโมเดลที่มีป้าย 'เห็นภาพ'"})
             return
-        pdf_notes = preprocess_pdf_docs(body, known[model_id]["vision"])
         try:
-            messages, has_images, notes = build_chat_messages(body)
+            pdf_notes = preprocess_pdf_docs(body, known[model_id]["vision"])
+            messages, has_images, notes = build_chat_messages(
+                body, image_limit=CHAT_MAX_MODEL_IMAGES)
         except ValueError as e:
             self._send(400, {"error": str(e)})
             return

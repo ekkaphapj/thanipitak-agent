@@ -271,6 +271,29 @@ class FreeComfyVramTest(unittest.TestCase):
             self.assertFalse(draw_server.free_comfy_vram())
 
 
+class ChatCatalogTest(unittest.TestCase):
+    def test_missing_capabilities_use_show_and_cache_model_details(self):
+        draw_server.CHAT_CAPABILITY_CACHE.clear()
+        tags = [{"model": "vl:4b", "digest": "vision"},
+                {"model": "embed:1", "digest": "embedding"}]
+
+        def show(req, **kwargs):
+            self.assertEqual(req.full_url, draw_server.OLLAMA + "/api/show")
+            model = json.loads(req.data)["model"]
+            caps = ["completion", "vision"] if model == "vl:4b" else ["embedding"]
+            return io.BytesIO(json.dumps({"capabilities": caps}).encode())
+
+        try:
+            with mock.patch.object(draw_server, "ollama_tags", return_value=tags), \
+                 mock.patch.object(urllib.request, "urlopen", side_effect=show) as upstream:
+                catalog = draw_server.chat_models()
+                self.assertEqual(catalog["models"], [{"id": "vl:4b", "label": "vl:4b", "vision": True}])
+                self.assertEqual(draw_server.chat_models(), catalog)
+                self.assertEqual(upstream.call_count, 2)
+        finally:
+            draw_server.CHAT_CAPABILITY_CACHE.clear()
+
+
 class WarmModelTest(unittest.TestCase):
     def test_warmup_matches_chat_runner_options(self):
         stream = OllamaStream([{"done": True}])
@@ -293,8 +316,12 @@ class WarmModelTest(unittest.TestCase):
 
             def read(self):
                 return json.dumps({"models": [
-                    {"name": "hot:1", "size": 10, "size_vram": 8},
-                    {"name": "cpu:1", "size": 10, "size_vram": 2},
+                    {"name": "hot:1", "size": 10, "size_vram": 8,
+                     "context_length": draw_server.CHAT_NUM_CTX},
+                    {"name": "cpu:1", "size": 10, "size_vram": 2,
+                     "context_length": draw_server.CHAT_NUM_CTX},
+                    {"name": "wrongctx:1", "size": 10, "size_vram": 8,
+                     "context_length": draw_server.CHAT_NUM_CTX // 2},
                 ]}).encode()
 
         real = urllib.request.urlopen
@@ -306,7 +333,13 @@ class WarmModelTest(unittest.TestCase):
         with mock.patch.object(urllib.request, "urlopen", side_effect=selective):
             self.assertTrue(draw_server.chat_model_ready("hot:1"))
             self.assertFalse(draw_server.chat_model_ready("cpu:1"))
+            self.assertFalse(draw_server.chat_model_ready("wrongctx:1"))
             self.assertFalse(draw_server.chat_model_ready("missing:1"))
+
+    def test_warmup_json_error_is_not_treated_as_ready(self):
+        with mock.patch.object(urllib.request, "urlopen", return_value=OllamaStream([{"error": "cannot load model"}])):
+            with self.assertRaisesRegex(RuntimeError, "cannot load model"):
+                draw_server.warm_chat_model("qwen3:8b")
 
 
 class ChatHttpTest(unittest.TestCase):
@@ -465,7 +498,121 @@ class ChatHttpTest(unittest.TestCase):
                 self.assertTrue(json.loads(response.read().decode().splitlines()[-1])["done"])
 
 
+    def test_pdf_only_reaches_poppler_before_empty_message_check(self):
+        for model, vision in (("vl:4b", True), ("qwen3:8b", False)):
+            with self.subTest(model=model):
+                body = {"model": model, "messages": [{"role": "user", "content": "",
+                        "docs": [{"name": "scan.pdf", "data": "QUJD"}]}]}
+                with self.ollama_mock([{"message": {"content": "อ่านได้"}, "done": True}]) as upstream, \
+                     mock.patch.object(draw_server, "chat_model_ready", return_value=True), \
+                     mock.patch.object(draw_server, "pdf_page_images", return_value=["AAA"]) as render, \
+                     mock.patch.object(draw_server, "pdf_text_via_poppler", return_value="ข้อความจาก PDF ภาษาไทยที่อ่านได้") as extract:
+                    with self.chat_post(body) as response:
+                        rows = [json.loads(l) for l in response.read().decode().splitlines()]
+                sent = json.loads(upstream.call_args.args[0].data)
+                self.assertTrue(rows[-1]["done"])
+                if vision:
+                    render.assert_called_once()
+                    self.assertEqual(sent["messages"][-1]["images"], ["AAA"])
+                else:
+                    extract.assert_called_once()
+                    self.assertIn("ข้อความจาก PDF", sent["messages"][-1]["content"])
+
+    def test_six_page_pdf_streams_and_preserves_final_content(self):
+        pages = [f"page{i}" for i in range(6)]
+        body = {"model": "vl:4b", "messages": [{"role": "user", "content": "สรุป",
+                "docs": [{"name": "report.pdf", "data": "QUJD"}]}]}
+        with self.ollama_mock([{"message": {"content": "ครบหกหน้า"}, "done": True}]) as upstream, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True), \
+             mock.patch.object(draw_server, "pdf_page_images", return_value=pages):
+            with self.chat_post(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines()]
+        sent = json.loads(upstream.call_args.args[0].data)
+        self.assertEqual(sent["messages"][-1]["images"], pages)
+        self.assertEqual("".join(r.get("delta", "") for r in rows), "ครบหกหน้า")
+        self.assertTrue(rows[-1]["done"])
+
+    def test_warmup_failure_emits_error_and_stops_heartbeat(self):
+        before = set(threading.enumerate())
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        with mock.patch.object(draw_server, "CHAT_HEARTBEAT", 0.01), \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=False), \
+             mock.patch.object(draw_server, "free_comfy_vram", return_value=True), \
+             mock.patch.object(draw_server, "warm_chat_model", side_effect=OSError("warmup failed")):
+            with self.chat_post(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines()]
+        self.assertIn("warmup failed", rows[-1].get("error", ""))
+        self.assertFalse(any(r.get("done") for r in rows))
+        self.assertFalse(any(t not in before and t.name == "chat-heartbeat"
+                             for t in threading.enumerate()))
+
+    def test_stream_errors_and_premature_eof_are_not_success(self):
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        for chunks in ([{"message": {"content": "partial"}, "done": False},
+                        {"error": "runner failed"}],
+                       [{"message": {"content": "partial"}, "done": False}]):
+            with self.subTest(chunks=chunks), self.ollama_mock(chunks), \
+                 mock.patch.object(draw_server, "chat_model_ready", return_value=True):
+                with self.chat_post(body) as response:
+                    rows = [json.loads(l) for l in response.read().decode().splitlines()]
+                self.assertIn("error", rows[-1])
+                self.assertFalse(any(r.get("done") for r in rows))
+                self.assertEqual("".join(r.get("delta", "") for r in rows), "partial")
+
+    def test_invalid_pdf_request_is_rejected_before_rendering(self):
+        for docs in ([None], [{"name": "x.pdf", "data": 123}],
+                     [{"name": "x.pdf", "data": "QUJD"}] * 5):
+            with self.subTest(docs=docs), mock.patch.object(draw_server, "pdf_page_images") as render:
+                body = {"model": "vl:4b", "messages": [{"role": "user", "content": "hi", "docs": docs}]}
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    self.chat_post(body)
+                self.assertEqual(error.exception.code, 400)
+                error.exception.close()
+                render.assert_not_called()
+
+    def test_empty_workbook_returns_attachment_error_instead_of_disconnect(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("xl/worksheets/sheet1.xml", "<worksheet/>")
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "",
+                "docs": [{"name": "broken.xlsx", "data": base64.b64encode(buf.getvalue()).decode()}]}]}
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.chat_post(body)
+        self.assertEqual(error.exception.code, 400)
+        self.assertIn("broken.xlsx", json.loads(error.exception.read().decode())["error"])
+        error.exception.close()
+
+
 class PdfPreprocessTest(unittest.TestCase):
+    def test_combined_image_budget_caps_pages_and_reports_omissions(self):
+        body = {"messages": [{"role": "user", "content": "",
+                "images": ["user"] * 4, "docs": [
+                    {"name": "one.pdf", "data": "QUJD"},
+                    {"name": "two.pdf", "data": "QUJD"}]}]}
+        with mock.patch.object(draw_server, "pdf_page_images", return_value=["page"] * 6) as render, \
+             mock.patch.object(draw_server, "pdf_text_via_poppler", return_value="ข้อความจากเอกสารไฟล์ที่สองที่อ่านได้"):
+            notes = draw_server.preprocess_pdf_docs(body, vision=True)
+        self.assertEqual(len(body["messages"][-1]["images"]), draw_server.CHAT_MAX_MODEL_IMAGES)
+        render.assert_called_once()
+        self.assertTrue(any("ไม่ได้ส่งอีก 2 หน้า" in n for n in notes))
+        messages, has_images, errors = draw_server.build_chat_messages(
+            body, image_limit=draw_server.CHAT_MAX_MODEL_IMAGES)
+        self.assertTrue(has_images)
+        self.assertEqual(errors, [])
+        self.assertIn("ไฟล์แนบ two.pdf", messages[-1]["content"])
+
+    def test_oversized_pdf_is_not_passed_to_poppler(self):
+        body = {"messages": [{"role": "user", "content": "read",
+                "docs": [{"name": "big.pdf", "data": "QUJD"}]}]}
+        with mock.patch.object(draw_server, "CHAT_MAX_FILE", 2), \
+             mock.patch.object(draw_server, "pdf_page_images") as render, \
+             mock.patch.object(draw_server, "pdf_text_via_poppler") as extract:
+            draw_server.preprocess_pdf_docs(body, vision=True)
+            _, _, errors = draw_server.build_chat_messages(body)
+        render.assert_not_called()
+        extract.assert_not_called()
+        self.assertTrue(any("big.pdf" in n for n in errors))
+
     def test_rescue_mojibake(self):
         clean = "รายงานภาพรวมองค์กรประจำปี"
         self.assertEqual(draw_server._rescue_mojibake(clean), clean)
