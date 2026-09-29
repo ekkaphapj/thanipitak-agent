@@ -210,7 +210,7 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
       <button class="send-btn" id="chat-send" type="submit">ส่ง ➤</button>
       <button class="stop-btn" id="chat-stop" type="button" style="display:none">■ หยุด</button>
     </form>
-    <p class="hint" style="margin-top:9px">แนบได้ทั้งเอกสาร (PDF, DOCX, XLSX, TXT สูงสุด 4 ไฟล์ ไฟล์ละ 10MB) และรูปภาพ (PNG, JPG สูงสุด 4 รูป) — รูปภาพต้องเลือกโมเดลที่มีป้าย "เห็นภาพ"</p>
+    <p class="hint" style="margin-top:9px">แนบได้ทั้งเอกสาร (PDF, DOCX, XLSX, TXT สูงสุด 4 ไฟล์ ไฟล์ละ 10MB) และรูปภาพ (PNG, JPG สูงสุด 4 รูป) — รูปภาพต้องเลือกโมเดลที่มีป้าย "เห็นภาพ" · <strong>วาง screenshot จากคลิปบอร์ดได้เลย (Ctrl+V)</strong></p>
   </section>
 </section>
 </main>
@@ -334,9 +334,7 @@ function renderAtts(){
   }
 }
 function readAsDataURL(file){return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(new Error("อ่านไฟล์ไม่สำเร็จ"));r.readAsDataURL(file)})}
-$("chat-files").addEventListener("change",async event=>{
-  const files=[...(event.target.files||[])];
-  event.target.value="";
+async function addChatFiles(files){
   for(const file of files){
     const isImage=file.type.startsWith("image/");
     if(isImage&&chatAtts.filter(a=>a.kind==="image").length>=4){setStatus("แนบรูปได้สูงสุด 4 รูป",true);continue}
@@ -353,6 +351,22 @@ $("chat-files").addEventListener("change",async event=>{
     }catch(err){setStatus(file.name+": "+err.message,true)}
   }
   renderAtts();
+}
+$("chat-files").addEventListener("change",async event=>{
+  const files=[...(event.target.files||[])];
+  event.target.value="";
+  await addChatFiles(files);
+});
+document.addEventListener("paste",async event=>{
+  if(pages.chat.hidden)return; // only in the chat tab
+  const items=[...(((event.clipboardData||{}).items)||[])];
+  const images=items.filter(i=>i.kind==="file"&&i.type.startsWith("image/"))
+    .map(i=>i.getAsFile()).filter(Boolean);
+  if(!images.length)return; // plain text paste continues as normal
+  event.preventDefault();
+  const stamp=new Date().toLocaleTimeString("th-TH");
+  await addChatFiles(images.map((f,i)=>new File([f],(f.name&&f.name!=="image.png"?f.name:`screenshot-${stamp}${images.length>1?"-"+(i+1):""}.png`),{type:f.type})));
+  $("chat-input").focus();
 });
 function mdLite(text){
   const esc=s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
