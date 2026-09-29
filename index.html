@@ -90,8 +90,12 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
 .msg.user{align-self:flex-end;border:1px solid #a8453d;background:linear-gradient(120deg,#8f1a18,#c2312a);color:#fff;border-bottom-right-radius:4px}
 .msg.assistant{align-self:flex-start;border:1px solid #4a4446;background:#232226;color:#eae7e7;border-bottom-left-radius:4px}
 .msg.assistant.error{border-color:#a8453d;color:#ffb3ad}
-.msg pre{margin:9px 0;padding:11px 12px;border-radius:9px;background:#141416;border:1px solid #3c383a;overflow-x:auto;font-size:13px}
+.msg pre{position:relative;margin:9px 0;padding:11px 12px;border-radius:9px;background:#141416;border:1px solid #3c383a;overflow-x:auto;font-size:13px}
 .msg code{font-family:Consolas,monospace}
+.copy-btn{position:absolute;top:5px;right:5px;padding:3px 9px;border:1px solid #575052;border-radius:7px;background:#1d1d20;color:#d9d3d4;font-size:11px;cursor:pointer;opacity:.8}
+.copy-btn:hover{border-color:#bb5a55;opacity:1}
+.msg-copy{display:inline-flex;align-items:center;gap:5px;margin-top:9px;padding:3px 10px;border:1px solid #575052;border-radius:7px;background:transparent;color:#b3adb0;font-size:11px;cursor:pointer}
+.msg-copy:hover{border-color:#bb5a55;color:#e5dfd1}
 .msg .att{display:inline-flex;align-items:center;gap:6px;margin:5px 6px 0 0;padding:5px 9px;border-radius:8px;background:rgba(0,0,0,.25);font-size:12px}
 .msg .thumb{display:block;max-width:180px;max-height:140px;border-radius:9px;margin-top:8px;border:1px solid rgba(255,255,255,.25)}
 .msg .note{display:block;margin-top:7px;color:#ffd39d;font-size:12px}
@@ -355,7 +359,7 @@ function mdLite(text){
   let out="";const parts=text.split("```");
   for(let i=0;i<parts.length;i++){
     if(i%2===0)out+=esc(parts[i]).replace(/`([^`\n]+)`/g,"<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g,"<strong>$1</strong>").replace(/\n/g,"<br>");
-    else out+="<pre><code>"+esc(parts[i].replace(/^\w+\n/,""))+"</code></pre>";
+    else out+='<pre><code>'+esc(parts[i].replace(/^\w+\n/,""))+'</code><button type="button" class="copy-btn" title="คัดลองโค้ด">⧉ คัดลอง</button></pre>';
   }
   return out;
 }
@@ -373,6 +377,17 @@ $("chat-input").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){
 $("chat-clear").addEventListener("click",()=>{chatHistory=[];$("chat-log").replaceChildren();$("chat-empty")});
 let chatAbort=null;
 $("chat-stop").addEventListener("click",()=>chatAbort&&chatAbort.abort());
+$("chat-log").addEventListener("click",async event=>{
+  const btn=event.target.closest("button");if(!btn)return;
+  const isCode=btn.classList.contains("copy-btn"),isMsg=btn.classList.contains("msg-copy");
+  if(!isCode&&!isMsg)return;
+  const text=isCode?btn.closest("pre").querySelector("code").textContent:btn._raw;
+  if(text==null)return;
+  const idle=isCode?"⧉ คัดลอง":"⧉ คัดลองข้อความ";
+  try{await navigator.clipboard.writeText(text);btn.textContent="✓ คัดลอกแล้ว"}
+  catch{btn.textContent="คัดลองไม่สำเร็จ (เบราว์เซอร์ไม่อนุญาต)"}
+  setTimeout(()=>{btn.textContent=idle},1600);
+});
 $("chat-form").addEventListener("submit",async event=>{
   event.preventDefault();
   if(chatBusy)return;
@@ -414,7 +429,11 @@ $("chat-form").addEventListener("submit",async event=>{
         if(chunk.stage)reply.textContent=chunk.stage==="freeing"?"กำลังปล่อยหน่วยความจำ GPU จาก ComfyUI…":"กำลังโหลดโมเดลเข้า GPU…";
         if(chunk.notes)for(const n of chunk.notes){const note=document.createElement("span");note.className="note";note.textContent="⚠ "+n;reply.appendChild(note)}
         if(chunk.delta){full+=chunk.delta;reply.innerHTML=mdLite(full)+'<span class="cursor"></span>';$("chat-log").scrollTop=$("chat-log").scrollHeight}
-        if(chunk.done){reply.innerHTML=mdLite(full);chatHistory.push({role:"user",content:userContent||text||"(ดูไฟล์แนบ)"},{role:"assistant",content:full});userContent=null}
+        if(chunk.done){
+          reply.innerHTML=mdLite(full);
+          if(full){const cp=document.createElement("button");cp.type="button";cp.className="msg-copy";cp.textContent="⧉ คัดลองข้อความ";cp._raw=full;reply.appendChild(cp)}
+          chatHistory.push({role:"user",content:userContent||text||"(ดูไฟล์แนบ)"},{role:"assistant",content:full});userContent=null
+        }
         if(chunk.error)throw new Error(chunk.error);
       }
     }
