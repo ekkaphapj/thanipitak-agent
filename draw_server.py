@@ -599,6 +599,12 @@ class Handler(BaseHTTPRequestHandler):
                     delta = chunk.get("message", {}).get("content", "")
                     if chunk.get("done"):
                         state["done"] = True
+                        usage = {"ctx": CHAT_NUM_CTX}
+                        if isinstance(chunk.get("prompt_eval_count"), int):
+                            usage["prompt"] = chunk["prompt_eval_count"]
+                        if isinstance(chunk.get("eval_count"), int):
+                            usage["eval"] = chunk["eval_count"]
+                        emit({"usage": usage})
                         if chunk.get("done_reason") == "length" or \
                                 chunk.get("finish_reason") == "length":
                             emit({"truncated": True})

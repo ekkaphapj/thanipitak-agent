@@ -297,7 +297,8 @@ class ChatHttpTest(unittest.TestCase):
         lines = [
             {"message": {"content": "สวัสดี"}, "done": False},
             {"message": {"content": " ครับ"}, "done": False},
-            {"message": {"content": ""}, "done": True},
+            {"message": {"content": ""}, "done": True,
+             "prompt_eval_count": 120, "eval_count": 8},
         ]
         body = {"model": "qwen3:8b", "messages": [
             {"role": "user", "content": "hi",
@@ -321,6 +322,9 @@ class ChatHttpTest(unittest.TestCase):
         self.assertEqual(stages, ["freeing", "loading"])
         self.assertEqual(rows[0]["user_content"], sent["messages"][-1]["content"])
         self.assertEqual("".join(r["delta"] for r in rows if "delta" in r), "สวัสดี ครับ")
+        usage = rows[-2]["usage"]
+        self.assertEqual(usage, {"ctx": draw_server.CHAT_NUM_CTX,
+                                 "prompt": 120, "eval": 8})
         self.assertTrue(rows[-1]["done"])
 
     def test_heartbeat_keeps_connection_alive_while_ollama_is_silent(self):
@@ -362,6 +366,8 @@ class ChatHttpTest(unittest.TestCase):
              mock.patch.object(draw_server, "warm_chat_model"):
             with self.chat_post(body) as response:
                 rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        kinds = [k for r in rows for k in r]
+        self.assertIn("usage", kinds)
         self.assertTrue(rows[-2]["truncated"])
         self.assertTrue(rows[-1]["done"])
 

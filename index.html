@@ -96,6 +96,9 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
 .copy-btn:hover{border-color:#bb5a55;opacity:1}
 .msg-copy{display:inline-flex;align-items:center;gap:5px;margin-top:9px;padding:3px 10px;border:1px solid #575052;border-radius:7px;background:transparent;color:#b3adb0;font-size:11px;cursor:pointer}
 .msg-copy:hover{border-color:#bb5a55;color:#e5dfd1}
+.msg .tok{display:inline-flex;align-items:center;margin:9px 0 0 8px;color:#8f8a8c;font-size:11px;font-variant-numeric:tabular-nums}
+.ctx-meter{display:flex;justify-content:flex-end;padding:5px 2px 0;color:#8f8a8c;font-size:11.5px;font-variant-numeric:tabular-nums}
+.ctx-meter.warn{color:#ffab7d}
 .msg .att{display:inline-flex;align-items:center;gap:6px;margin:5px 6px 0 0;padding:5px 9px;border-radius:8px;background:rgba(0,0,0,.25);font-size:12px}
 .msg .thumb{display:block;max-width:180px;max-height:140px;border-radius:9px;margin-top:8px;border:1px solid rgba(255,255,255,.25)}
 .msg .note{display:block;margin-top:7px;color:#ffd39d;font-size:12px}
@@ -203,6 +206,7 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
     <div class="chat-log" id="chat-log" aria-live="polite">
       <div class="chat-empty" id="chat-empty"><div class="empty-icon" aria-hidden="true">💬</div>เริ่มบทสนทนาได้เลย — ถามอะไรก็ได้ทั้งภาษาไทยและอังกฤษ<br>แนบเอกสารหรือรูปภาพมาถามได้จากช่องด้านล่าง</div>
     </div>
+    <div class="ctx-meter" id="ctx-meter" hidden>🧠 บริบท: –</div>
     <div class="chat-att" id="chat-att"></div>
     <form id="chat-form" class="chat-form">
       <label class="attach-btn" for="chat-files" title="แนบไฟล์">📎<input type="file" id="chat-files" multiple accept=".pdf,.docx,.xlsx,.txt,.md,.csv,.json,.png,.jpg,.jpeg"></label>
@@ -388,8 +392,15 @@ function addBubble(role){
 function autoGrow(el){el.style.height="auto";el.style.height=Math.min(el.scrollHeight,150)+"px"}
 $("chat-input").addEventListener("input",e=>autoGrow(e.target));
 $("chat-input").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();$("chat-form").requestSubmit()}});
-$("chat-clear").addEventListener("click",()=>{chatHistory=[];$("chat-log").replaceChildren();$("chat-empty")});
-let chatAbort=null;
+$("chat-clear").addEventListener("click",()=>{chatHistory=[];lastUsage=null;$("ctx-meter").hidden=true;$("chat-log").replaceChildren();$("chat-empty")});
+let chatAbort=null,lastUsage=null;
+const fmtTok=n=>Number(n||0).toLocaleString("en-US");
+function updateCtxMeter(u){
+  const used=(u.prompt||0)+(u.eval||0),total=u.ctx||0,left=Math.max(0,total-used);
+  const m=$("ctx-meter");m.hidden=false;
+  m.classList.toggle("warn",left<total*0.15);
+  m.textContent="🧠 บริบท "+fmtTok(used)+" / "+fmtTok(total)+" tokens · เหลืออีก "+fmtTok(left);
+}
 $("chat-stop").addEventListener("click",()=>chatAbort&&chatAbort.abort());
 $("chat-log").addEventListener("click",async event=>{
   const btn=event.target.closest("button");if(!btn)return;
@@ -451,10 +462,12 @@ $("chat-form").addEventListener("submit",async event=>{
         if(chunk.stage)reply.textContent=chunk.stage==="freeing"?"กำลังปล่อยหน่วยความจำ GPU จาก ComfyUI…":"กำลังโหลดโมเดลเข้า GPU…";
         if(chunk.notes)for(const n of chunk.notes){const note=document.createElement("span");note.className="note";note.textContent="⚠ "+n;reply.appendChild(note)}
         if(chunk.delta){full+=chunk.delta;reply.innerHTML=mdLite(full)+'<span class="cursor"></span>';$("chat-log").scrollTop=$("chat-log").scrollHeight}
+        if(chunk.usage){lastUsage=chunk.usage;updateCtxMeter(lastUsage)}
         if(chunk.truncated){const note=document.createElement("span");note.className="note";note.textContent="⚠ คำตอบถูกตัดเพราะเต็มขอบเขตความจำ — พิมพ์ \"ต่อ\" เพื่อให้เขียนต่อจากที่ค้างไว้";reply.appendChild(note)}
         if(chunk.done){
           reply.innerHTML=mdLite(full);
-          if(full){const cp=document.createElement("button");cp.type="button";cp.className="msg-copy";cp.textContent="⧉ คัดลองข้อความ";cp._raw=full;reply.appendChild(cp)}
+          if(full){const cp=document.createElement("button");cp.type="button";cp.className="msg-copy";cp.textContent="⧉ คัดลอกข้อความ";cp._raw=full;reply.appendChild(cp);
+            if(lastUsage&&typeof lastUsage.eval==="number"){const tok=document.createElement("span");tok.className="tok";tok.textContent="▲ "+fmtTok(lastUsage.eval)+" tokens";reply.appendChild(tok)}}
           chatHistory.push({role:"user",content:userContent||text||"(ดูไฟล์แนบ)"},{role:"assistant",content:full});userContent=null
         }
         if(chunk.error)throw new Error(chunk.error);
