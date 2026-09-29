@@ -11,6 +11,9 @@ import binascii
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -50,6 +53,7 @@ CHAT_HEARTBEAT = 15  # seconds between keepalive lines while Ollama is silent
 CHAT_KEEP_ALIVE = os.environ.get("CHAT_KEEP_ALIVE", "30m")
 CHAT_NUM_CTX = int(os.environ.get("CHAT_NUM_CTX", "32768"))  # default 4k cuts long code
 WARMUP_TIMEOUT = 300
+PDF_PAGES_MAX = int(os.environ.get("CHAT_PDF_PAGES", "6"))
 DEFAULT_MODEL_ID = "qwen-image-2.1"
 FLUX_MODEL_ID = "flux.2-klein-4b"
 RESOLUTIONS = [512, 640, 768, 896, 1024]
@@ -285,6 +289,102 @@ def extract_pdf(data):
     return " ".join(out).strip()
 
 
+def _rescue_mojibake(text):
+    """Fix Thai text whose UTF-8 bytes were decoded with a Thai codepage.
+
+    PDFs whose embedded fonts lack proper ToUnicode maps extract as junk like
+    'เธฃเธฒเธข'. U+0E00 never occurs in real Thai, so when it shows up we try
+    re-encoding through ISO-8859-11 (TIS-620) back to UTF-8.
+    """
+    if text.count("\u0e00") < 3:
+        return text
+    try:
+        fixed = text.encode("iso-8859-11", "ignore").decode("utf-8", "ignore")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    if fixed.count("\u0e00") < text.count("\u0e00") and len(fixed) > 0.5 * len(text):
+        return fixed
+    return text
+
+
+def pdf_page_images(data, max_pages):
+    """Render PDF pages to JPEG base64 via poppler's pdftoppm; [] when absent."""
+    if not shutil.which("pdftoppm"):
+        return []
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "doc.pdf"
+        src.write_bytes(data)
+        try:
+            subprocess.run(
+                ["pdftoppm", "-jpeg", "-r", "110", "-l", str(max_pages),
+                 str(src), str(Path(td) / "p")],
+                check=True, timeout=120, capture_output=True)
+        except (subprocess.SubprocessError, OSError):
+            return []
+        pages = []
+        for p in sorted(Path(td).glob("p-*.jpg")):
+            raw = p.read_bytes()
+            if raw and len(raw) <= CHAT_MAX_FILE:
+                pages.append(base64.b64encode(raw).decode())
+        return pages
+
+
+def pdf_text_via_poppler(data):
+    """pdftotext extraction (handles proper text PDFs incl. Thai) -> str."""
+    if not shutil.which("pdftotext"):
+        return ""
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "doc.pdf"
+        src.write_bytes(data)
+        try:
+            subprocess.run(
+                ["pdftotext", "-layout", str(src), str(Path(td) / "out.txt")],
+                check=True, timeout=120, capture_output=True)
+            return _rescue_mojibake(
+                (Path(td) / "out.txt").read_text(encoding="utf-8", errors="replace"))
+        except (subprocess.SubprocessError, OSError):
+            return ""
+
+
+def preprocess_pdf_docs(body, vision):
+    """Give PDFs a real reader before generic extraction.
+
+    With a vision model, render pages to images (charts/scans have no usable
+    text layer). Otherwise extract text with poppler; whatever succeeds is
+    attached as pre-extracted text. Returns extra user-facing notes.
+    """
+    last = body["messages"][-1]
+    docs = last.get("docs") or []
+    if not docs:
+        return []
+    images = last.setdefault("images", [])
+    notes = []
+    for doc in list(docs):
+        name = str(doc.get("name", "file"))
+        if not name.lower().endswith(".pdf"):
+            continue
+        try:
+            data = base64.b64decode(doc.get("data") or "", validate=False)
+        except (binascii.Error, ValueError):
+            continue  # build_chat_messages will report the broken file
+        if vision:
+            pages = pdf_page_images(data, PDF_PAGES_MAX)
+            if pages:
+                room = max(0, 8 - len(images))
+                take = pages[:room]
+                if take:
+                    images.extend(take)
+                    docs.remove(doc)
+                    notes.append(f"{name}: แปลงเป็นภาพ {len(take)} หน้า "
+                                 f"ให้โมเดลอ่านจากรูปโดยตรง")
+                    continue
+        text = pdf_text_via_poppler(data)
+        if len(text.strip()) >= 20:
+            doc.pop("data", None)
+            doc["text"] = text[:60000]
+    return notes
+
+
 def extract_attachment(name, data):
     """-> (text, error message). Exactly one is None."""
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
@@ -360,7 +460,12 @@ def build_chat_messages(payload):
         raise ValueError(f"too many documents (max {CHAT_MAX_DOCS})")
     blocks, errors = [], []
     for doc in docs:
-        if not isinstance(doc, dict) or not isinstance(doc.get("data"), str):
+        if not isinstance(doc, dict):
+            raise ValueError("invalid attachment")
+        if isinstance(doc.get("text"), str):  # pre-extracted (poppler path)
+            blocks.append(f"ไฟล์แนบ {doc.get('name')}:\n{doc['text'][:60000]}")
+            continue
+        if not isinstance(doc.get("data"), str):
             raise ValueError("invalid attachment")
         try:
             data = base64.b64decode(doc["data"], validate=False)
@@ -770,6 +875,13 @@ class Handler(BaseHTTPRequestHandler):
         if has_images and not known[model_id]["vision"]:
             self._send(400, {"error": "โมเดลที่เลือกไม่รองรับรูปภาพ กรุณาเลือกโมเดลที่มีป้าย 'เห็นภาพ'"})
             return
+        pdf_notes = preprocess_pdf_docs(body, known[model_id]["vision"])
+        try:
+            messages, has_images, notes = build_chat_messages(body)
+        except ValueError as e:
+            self._send(400, {"error": str(e)})
+            return
+        notes = pdf_notes + (notes or [])
         self._stream_chat(model_id, messages, notes)
 
     def log_message(self, *args):

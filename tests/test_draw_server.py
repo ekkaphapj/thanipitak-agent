@@ -390,6 +390,49 @@ class ChatHttpTest(unittest.TestCase):
                 self.assertTrue(json.loads(response.read().decode().splitlines()[-1])["done"])
 
 
+class PdfPreprocessTest(unittest.TestCase):
+    def test_rescue_mojibake(self):
+        clean = "รายงานภาพรวมองค์กรประจำปี"
+        self.assertEqual(draw_server._rescue_mojibake(clean), clean)
+        broken = "เธฃเธฒเธขเธเธฒเธฃเธญเธเธดเธเธ"  # U+0E00 mojibake of รายงาน
+        fixed = draw_server._rescue_mojibake(broken + " ok")
+        self.assertEqual(fixed.count("\u0e00"), 0)
+
+    def test_vision_model_gets_page_images(self):
+        body = {"messages": [{"role": "user", "content": "ตีความ",
+                              "docs": [{"name": "chart.pdf", "data": "QUJD"}]}]}
+        with mock.patch.object(draw_server, "pdf_page_images",
+                               return_value=["AAA", "BBB"]):
+            notes = draw_server.preprocess_pdf_docs(body, vision=True)
+        self.assertEqual(body["messages"][-1]["images"], ["AAA", "BBB"])
+        self.assertEqual(body["messages"][-1]["docs"], [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("แปลงเป็นภาพ 2 หน้า", notes[0])
+
+    def test_text_model_gets_poppler_text(self):
+        body = {"messages": [{"role": "user", "content": "สรุป",
+                              "docs": [{"name": "doc.pdf", "data": "QUJD"}]}]}
+        with mock.patch.object(draw_server, "pdf_text_via_poppler",
+                               return_value="หน้าหนึ่ง\nหน้าสอง\nข้อมูลเพิ่ม"):
+            notes = draw_server.preprocess_pdf_docs(body, vision=False)
+        doc = body["messages"][-1]["docs"][0]
+        self.assertNotIn("data", doc)
+        self.assertEqual(doc["text"], "หน้าหนึ่ง\nหน้าสอง\nข้อมูลเพิ่ม")
+        self.assertEqual(notes, [])
+        messages, has_images, err_notes = draw_server.build_chat_messages(body)
+        self.assertIn("หน้าหนึ่ง", messages[-1]["content"])
+        self.assertIn("ไฟล์แนบ doc.pdf", messages[-1]["content"])
+
+    def test_no_poppler_and_no_text_keeps_doc_for_standard_note(self):
+        body = {"messages": [{"role": "user", "content": "ดูไฟล์",
+                              "docs": [{"name": "x.pdf", "data": "QUJD"}]}]}
+        with mock.patch.object(draw_server, "pdf_page_images", return_value=[]), \
+             mock.patch.object(draw_server, "pdf_text_via_poppler", return_value=""):
+            notes = draw_server.preprocess_pdf_docs(body, vision=True)
+        self.assertEqual(notes, [])
+        self.assertEqual(body["messages"][-1]["docs"][0]["data"], "QUJD")
+
+
 class QueuePositionTest(unittest.TestCase):
     def test_counts_running_and_pending(self):
         queue = {"queue_running": [[1, "a"]],

@@ -441,7 +441,9 @@ $("chat-form").addEventListener("submit",async event=>{
   reply.innerHTML='<span class="cursor"></span>';
   chatBusy=true;$("chat-send").disabled=true;$("chat-stop").style.display="inline-block";
   chatAbort=new AbortController();
-  let full="",userContent=null;
+  let full="",userContent=null;const streamNotes=[];
+  const escHtml=s=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  const notesHtml=()=>streamNotes.map(n=>'<span class="note">⚠ '+escHtml(n)+"</span>").join("");
   try{
     const response=await fetch("/api/chat",{method:"POST",signal:chatAbort.signal,
       headers:{"Content-Type":"application/json"},
@@ -459,13 +461,13 @@ $("chat-form").addEventListener("submit",async event=>{
         let chunk;try{chunk=JSON.parse(line)}catch{continue}
         if(chunk.user_content)userContent=chunk.user_content;
         if(chunk.beat)continue;
+        if(chunk.notes)for(const n of chunk.notes)streamNotes.push(n);
         if(chunk.stage)reply.textContent=chunk.stage==="freeing"?"กำลังปล่อยหน่วยความจำ GPU จาก ComfyUI…":"กำลังโหลดโมเดลเข้า GPU…";
-        if(chunk.notes)for(const n of chunk.notes){const note=document.createElement("span");note.className="note";note.textContent="⚠ "+n;reply.appendChild(note)}
-        if(chunk.delta){full+=chunk.delta;reply.innerHTML=mdLite(full)+'<span class="cursor"></span>';$("chat-log").scrollTop=$("chat-log").scrollHeight}
+        if(chunk.delta){full+=chunk.delta;reply.innerHTML=notesHtml()+mdLite(full)+'<span class="cursor"></span>';$("chat-log").scrollTop=$("chat-log").scrollHeight}
         if(chunk.usage){lastUsage=chunk.usage;updateCtxMeter(lastUsage)}
-        if(chunk.truncated){const note=document.createElement("span");note.className="note";note.textContent="⚠ คำตอบถูกตัดเพราะเต็มขอบเขตความจำ — พิมพ์ \"ต่อ\" เพื่อให้เขียนต่อจากที่ค้างไว้";reply.appendChild(note)}
+        if(chunk.truncated)streamNotes.push("คำตอบถูกตัดเพราะเต็มขอบเขตความจำ — พิมพ์ \"ต่อ\" เพื่อให้เขียนต่อจากที่ค้างไว้");
         if(chunk.done){
-          reply.innerHTML=mdLite(full);
+          reply.innerHTML=notesHtml()+mdLite(full);
           if(full){const cp=document.createElement("button");cp.type="button";cp.className="msg-copy";cp.textContent="⧉ คัดลอกข้อความ";cp._raw=full;reply.appendChild(cp);
             if(lastUsage&&typeof lastUsage.eval==="number"){const tok=document.createElement("span");tok.className="tok";tok.textContent="▲ "+fmtTok(lastUsage.eval)+" tokens";reply.appendChild(tok)}}
           chatHistory.push({role:"user",content:userContent||text||"(ดูไฟล์แนบ)"},{role:"assistant",content:full});userContent=null
