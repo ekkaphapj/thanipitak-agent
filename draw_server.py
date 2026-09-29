@@ -46,6 +46,7 @@ CHAT_MAX_FILE = 10 * 1024 * 1024
 CHAT_MAX_IMAGES = 4
 CHAT_MAX_DOCS = 4
 CHAT_TIMEOUT = 600
+CHAT_HEARTBEAT = 15  # seconds between keepalive lines while Ollama is silent
 DEFAULT_MODEL_ID = "qwen-image-2.1"
 FLUX_MODEL_ID = "flux.2-klein-4b"
 RESOLUTIONS = [512, 640, 768, 896, 1024]
@@ -520,16 +521,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+        wlock = threading.Lock()
+        state = {"done": False}
 
         def emit(obj):
-            self.wfile.write(json.dumps(obj, ensure_ascii=False).encode() + b"\n")
-            self.wfile.flush()
+            with wlock:
+                self.wfile.write(json.dumps(obj, ensure_ascii=False).encode() + b"\n")
+                self.wfile.flush()
 
         if notes:
             emit({"notes": notes})
         # exact user content (docs inlined) so the browser history matches
         # what the model saw and follow-up questions keep the file context
         emit({"user_content": messages[-1]["content"]})
+
+        def heartbeat():
+            # Cloudflare and middleboxes drop connections that sit silent
+            # while Ollama cold-loads a model (up to minutes on this GPU)
+            while not state["done"]:
+                time.sleep(CHAT_HEARTBEAT)
+                if not state["done"]:
+                    try:
+                        emit({"beat": True})
+                    except OSError:
+                        return
+
+        threading.Thread(target=heartbeat, daemon=True).start()
         try:
             with urllib.request.urlopen(req, timeout=CHAT_TIMEOUT) as r:
                 for line in r:
@@ -541,12 +558,15 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     delta = chunk.get("message", {}).get("content", "")
                     if chunk.get("done"):
+                        state["done"] = True
                         emit({"done": True})
                         return
                     if delta:
                         emit({"delta": delta})
+            state["done"] = True
             emit({"done": True})
         except Exception as e:  # tell the browser instead of dying mid-stream
+            state["done"] = True
             try:
                 emit({"error": str(e)[:300]})
             except OSError:

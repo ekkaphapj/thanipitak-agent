@@ -279,6 +279,34 @@ class ChatHttpTest(unittest.TestCase):
         self.assertEqual("".join(r["delta"] for r in rows if "delta" in r), "สวัสดี ครับ")
         self.assertTrue(rows[-1]["done"])
 
+    def test_heartbeat_keeps_connection_alive_while_ollama_is_silent(self):
+        class SlowStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                time.sleep(0.25)  # model "cold load": no tokens for a while
+                yield json.dumps({"message": {"content": "ok"}, "done": True}).encode() + b"\n"
+
+        real_urlopen = urllib.request.urlopen
+
+        def selective(url, *args, **kwargs):
+            target = url.full_url if isinstance(url, urllib.request.Request) else url
+            if target.startswith(draw_server.OLLAMA):
+                return SlowStream()
+            return real_urlopen(url, *args, **kwargs)
+
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        with mock.patch.object(draw_server, "CHAT_HEARTBEAT", 0.05), \
+             mock.patch.object(urllib.request, "urlopen", side_effect=selective):
+            with self.chat_post(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        self.assertGreaterEqual(len([r for r in rows if "beat" in r]), 1)
+        self.assertTrue(rows[-1]["done"])
+
     def test_image_without_vision_model_is_rejected(self):
         body = {"model": "qwen3:8b", "messages": [
             {"role": "user", "content": "ดูรูป", "images": ["QUJD"]}]}

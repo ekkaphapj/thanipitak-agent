@@ -410,6 +410,7 @@ $("chat-form").addEventListener("submit",async event=>{
         if(!line.trim())continue;
         let chunk;try{chunk=JSON.parse(line)}catch{continue}
         if(chunk.user_content)userContent=chunk.user_content;
+        if(chunk.beat)continue;
         if(chunk.notes)for(const n of chunk.notes){const note=document.createElement("span");note.className="note";note.textContent="⚠ "+n;reply.appendChild(note)}
         if(chunk.delta){full+=chunk.delta;reply.innerHTML=mdLite(full)+'<span class="cursor"></span>';$("chat-log").scrollTop=$("chat-log").scrollHeight}
         if(chunk.done){reply.innerHTML=mdLite(full);chatHistory.push({role:"user",content:userContent||text||"(ดูไฟล์แนบ)"},{role:"assistant",content:full});userContent=null}
