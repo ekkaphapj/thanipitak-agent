@@ -16,6 +16,10 @@ python .\draw_server.py
 
 เปิด `http://127.0.0.1:8190` การตั้งค่าเริ่มต้นของเซิร์ฟเวอร์ใช้ `~/ComfyUI` และพอร์ต `8190`; ปรับได้ด้วย `COMFY_HOME`, `COMFY_URL`, `COMFY_OUTPUT_DIR`, `COMFY_INPUT_DIR`, `COMFY_MODEL_ROOT`, `DRAW_HOST` และ `DRAW_PORT`.
 
+### การเข้าสู่ระบบ
+
+หน้าเว็บขอรหัสผ่านก่อนใช้งาน (ค่าเริ่มต้น `thanipitak1` ปรับได้ด้วย environment variable `DRAW_PASSWORD`) เมื่อกรอกถูก เบราว์เซอร์จะได้ bearer token ที่เก็บใน localStorage และคงอยู่ 30 วัน หรือจนกว่าเซิร์ฟเวอร์จะรีสตาร์ท (session เก็บในหน่วยความจำ) ทุก endpoint ใต้ `/api/*` ต้องแนบ header `Authorization: Bearer <token>` ยกเว้น `POST /api/login` และ `GET /api/session`
+
 ### แปลคำบรรยายภาษาไทยอัตโนมัติ
 
 Qwen-Image เข้าใจคำบรรยายภาษาอังกฤษได้ดีกว่าภาษาไทยอย่างชัดเจน ถ้าตั้งค่า `ENRICHER_URL` เป็น endpoint แบบ OpenAI-compatible (เช่น Ollama `http://127.0.0.1:11434/v1/chat/completions`) เซิร์ฟเวอร์จะตรวจหาอักษรไทยใน prompt แล้วเรียก LLM แปลเป็นภาษาอังกฤษแบบละเอียดก่อนสร้างภาพ โดยคงข้อความในเครื่องหมายคำพูด `" "` ไว้ตรงตามเดิมเพื่อให้ปรากฏในภาพ ถ้าไม่ตั้งค่าหรือ LLM ล่ม ระบบจะส่ง prompt เดิมต่อทันที งานไม่มีวันค้าง:
@@ -28,7 +32,7 @@ Qwen-Image เข้าใจคำบรรยายภาษาอังกฤ
 
 ทุกโปรไฟล์ใช้ sampler `euler` + scheduler `simple` และ CFG 1.0 ตามสูตรของ Qwen-Image-2.1: `fast` 12 steps · `medium` 20 steps · `quality` 25 steps การดัน CFG เกิน 1 ทำให้ภาพเบลอและช้าขึ้น จึงไม่ใช้ สิ่งที่ไม่ต้องการถูกเติมต่อท้ายคำบรรยายเป็นบรรทัด `Avoid:` เพราะที่ CFG 1 ตัว sampler ไม่ได้คำนวณ negative conditioning
 
-เว็บเซิร์ฟเวอร์ควรรับการเชื่อมต่อจาก loopback เท่านั้นเมื่อยังไม่มีระบบยืนยันตัวตน หากต้องเปิดผ่านอินเทอร์เน็ต ให้วาง Cloudflare Access หรือระบบยืนยันตัวตนและ reverse proxy ไว้ด้านหน้า
+ระบบ login เป็นรหัสผ่านร่วมใช้กันทุกคนที่รู้รหัส ไม่มีบัญชีผู้ใช้รายบุคคล รหัสผ่านผิดจะถูกหน่วง 0.8 วินาทีเพื่อถ่วงการเดารหัส หากเปิดผ่านอินเทอร์เน็ตจริงจัง ควรวาง Cloudflare Access หรือระบบยืนยันตัวตนแข็งแรงกว่านี้และ reverse proxy ไว้ด้านหน้าเพิ่ม
 
 ## โมเดล
 
@@ -41,6 +45,8 @@ Qwen-Image เข้าใจคำบรรยายภาษาอังกฤ
 
 ## API
 
+- `POST /api/login` รับ `{"password": "..."}` คืน `{"token", "expires_in"}` (30 วัน)
+- `GET /api/session` ตรวจความถูกต้องของ token
 - `GET /api/health` และ `GET /api/models`
 - `POST /api/generate` รับ `prompt`, `model`, `profile`, `resolution` และตัวเลือกที่โมเดลรองรับ แล้วคืนรหัสงานทันที
 - `GET /api/status/<id>` ตรวจสถานะงาน

@@ -8,11 +8,13 @@ Both async patterns keep HTTP responses short so Cloudflare never times out.
 """
 import base64
 import binascii
+import hmac
 import html
 import io
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -41,6 +43,9 @@ FLUX_VAE = "flux2-vae.safetensors"
 MODEL_ROOT = Path(os.environ.get("COMFY_MODEL_ROOT", str(COMFY_HOME / "models")))
 HOST = os.environ.get("DRAW_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DRAW_PORT", "8190"))
+# Shared-password gate: the browser trades DRAW_PASSWORD for a bearer token.
+DRAW_PASSWORD = os.environ.get("DRAW_PASSWORD", "thanipitak1")
+SESSION_TTL = 30 * 24 * 3600  # seconds before the browser must log in again
 # Optional OpenAI-compatible chat endpoint (Ollama/LM Studio/vLLM) that turns
 # Thai prompts into detailed English ones. Empty = prompts pass through as-is.
 ENRICHER_URL = os.environ.get("ENRICHER_URL", "").rstrip("/")
@@ -98,6 +103,8 @@ MODELS = {
 
 JOBS = {}
 LOCK = threading.Lock()
+SESSIONS = {}  # bearer token -> expiry; a server restart logs everyone out
+SESSION_LOCK = threading.Lock()
 HERE = Path(__file__).resolve().parent
 PROMPT_CACHE = {}
 PROMPT_CACHE_MAX = 256
@@ -905,6 +912,22 @@ def run_job(job_id, spec, ref_path=None):
                 pass
 
 
+def create_session():
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with SESSION_LOCK:
+        for stale, expiry in list(SESSIONS.items()):
+            if expiry <= now:
+                SESSIONS.pop(stale, None)
+        SESSIONS[token] = now + SESSION_TTL
+    return token
+
+
+def session_valid(token):
+    with SESSION_LOCK:
+        return bool(token) and SESSIONS.get(token, 0) > time.time()
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8",
               cache=None):
@@ -921,6 +944,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(data)
+
+    def _authorized(self):
+        header = self.headers.get("Authorization", "")
+        scheme, _, token = header.partition(" ")
+        return scheme.lower() == "bearer" and session_valid(token.strip())
+
+    def _handle_login(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > 65536:
+                raise ValueError("invalid body length")
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict) or not isinstance(body.get("password"), str):
+                raise ValueError("invalid body")
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            self._send(400, {"error": "invalid json"})
+            return
+        if not hmac.compare_digest(body["password"].encode(), DRAW_PASSWORD.encode()):
+            time.sleep(0.8)  # blunt password guessing through the tunnel
+            self._send(401, {"error": "รหัสผ่านไม่ถูกต้อง"})
+            return
+        self._send(200, {"token": create_session(), "expires_in": SESSION_TTL})
 
     def _stream_chat(self, model_id, messages, notes):
         payload = {"model": model_id, "messages": messages,
@@ -1013,22 +1058,30 @@ class Handler(BaseHTTPRequestHandler):
             heartbeat_thread.join(timeout=1)
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        route = self.path.split("?", 1)[0]
+        if route in ("/", "/index.html"):
             html = (HERE / "index.html").read_text(encoding="utf-8")
             self._send(200, html, "text/html; charset=utf-8", cache="no-cache")
-        elif self.path == "/api/health":
+        elif route == "/api/session":
+            if self._authorized():
+                self._send(200, {"ok": True})
+            else:
+                self._send(401, {"error": "ต้องเข้าสู่ระบบก่อนใช้งาน"})
+        elif route.startswith("/api/") and not self._authorized():
+            self._send(401, {"error": "ต้องเข้าสู่ระบบก่อนใช้งาน"})
+        elif route == "/api/health":
             self._send(200, {"ok": True, "model": MODEL,
                              "available_models": [m["id"] for m in model_catalog()["models"]
                                                   if m["available"]]})
-        elif self.path == "/api/models":
+        elif route == "/api/models":
             self._send(200, model_catalog())
-        elif self.path == "/api/chat/models":
+        elif route == "/api/chat/models":
             try:
                 self._send(200, chat_models())
             except Exception:
                 self._send(503, {"error": "ollama ไม่พร้อมใช้งาน"})
-        elif self.path.startswith("/api/status/"):
-            jid = self.path.rsplit("/", 1)[-1]
+        elif route.startswith("/api/status/"):
+            jid = route.rsplit("/", 1)[-1]
             with LOCK:
                 job = dict(JOBS.get(jid, {}))
             job.setdefault("status", "unknown")
@@ -1037,8 +1090,8 @@ class Handler(BaseHTTPRequestHandler):
                 if ahead is not None:
                     job["queue_ahead"] = ahead
             self._send(200, job)
-        elif self.path.startswith("/api/image/"):
-            jid = self.path.rsplit("/", 1)[-1]
+        elif route.startswith("/api/image/"):
+            jid = route.rsplit("/", 1)[-1]
             with LOCK:
                 filename = JOBS.get(jid, {}).get("file")
             if not filename:
@@ -1054,10 +1107,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path == "/api/chat":
+        route = self.path.split("?", 1)[0]
+        if route == "/api/login":
+            self._handle_login()
+            return
+        if route.startswith("/api/") and not self._authorized():
+            self._send(401, {"error": "ต้องเข้าสู่ระบบก่อนใช้งาน"})
+            return
+        if route == "/api/chat":
             self._handle_chat()
             return
-        if self.path != "/api/generate":
+        if route != "/api/generate":
             self._send(404, {"error": "not found"})
             return
         try:

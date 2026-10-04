@@ -119,9 +119,33 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
 .send-btn:disabled{opacity:.55;cursor:wait}
 .stop-btn{flex:none;padding:12px 14px;border:1px solid #89504d;border-radius:11px;background:transparent;color:#ffd8d4;font-weight:700;cursor:pointer}
 @media(max-width:580px){.chat-panel{padding:16px}.msg{max-width:94%}.chat-controls{width:100%}.chat-controls select{flex:1;max-width:none}}
+/* ---- login gate ---- */
+.login-gate{position:fixed;inset:0;z-index:60;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 72% -18%,rgba(189,36,35,.25),transparent 38rem),linear-gradient(160deg,#171719,#101012 60%)}
+.login-gate[hidden]{display:none}
+.login-card{width:min(400px,100%);padding:34px 30px 30px;border:1px solid #3a3537;border-radius:20px;background:#202023;box-shadow:0 24px 70px rgba(0,0,0,.45);text-align:center}
+.login-icon{display:grid;place-items:center;width:72px;height:72px;margin:0 auto 16px;border:1px solid #67413f;border-radius:21px;background:#382425;color:#f47d73;font-size:32px}
+.login-card h2{margin:0 0 6px;font-size:24px;letter-spacing:-.02em}
+.login-desc{margin:0 0 22px;color:#aaa7a9;font-size:13px;line-height:1.6}
+.login-label{display:block;margin:0 0 8px;text-align:left;font-size:14px;font-weight:650;color:#f0eded}
+#login-password{display:block;width:100%;padding:14px 15px;border:1px solid #5b5557;border-radius:12px;color:#fff;background:#151517;font-size:16px;line-height:1.55}
+#login-password:focus{border-color:#ed5d55}
+.login-err{min-height:20px;margin:10px 0 0;color:#ff8f88;font-size:13px;line-height:1.5}
+.login-btn{margin-top:14px}
 </style>
 </head>
 <body>
+<div class="login-gate" id="login-gate">
+  <form class="login-card" id="login-form">
+    <div class="login-icon" aria-hidden="true">🔐</div>
+    <p class="eyebrow">THANI PITAK AI</p>
+    <h2>เข้าสู่ระบบ</h2>
+    <p class="login-desc">กรอกรหัสผ่านเพื่อเริ่มใช้งานระบบสร้างรูปภาพและสนทนาด้วย AI ในเครื่อง</p>
+    <label class="login-label" for="login-password">รหัสผ่าน</label>
+    <input type="password" id="login-password" autocomplete="current-password" required>
+    <p class="login-err" id="login-err" role="alert"></p>
+    <button class="primary login-btn" id="login-btn" type="submit">เข้าสู่ระบบ</button>
+  </form>
+</div>
 <div class="shell">
 <header class="header">
   <div class="brand">
@@ -248,7 +272,7 @@ function applyModel(){
 }
 async function loadModels(){
   try{
-    const data=await jsonResponse(await fetch("/api/models",{cache:"no-store"}));
+    const data=await jsonResponse(await authFetch("/api/models",{cache:"no-store"}));
     if(!Array.isArray(data.models))throw new Error("รายการโมเดลไม่ถูกต้อง");
     models=data.models;
     $("thai-hint").hidden=!data.prompt_enhancer;
@@ -269,7 +293,7 @@ async function generate(event){
   startedAt=Date.now();updateClock();clock=setInterval(updateClock,1000);
   try{
     const profile=hasSpeedProfiles(model)?form.elements.profile.value:model.default_profile;
-    const job=await jsonResponse(await fetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt,model:model.id,negative:model.supports_negative?$("negative").value:"",profile,resolution:Number(form.elements.resolution.value),reference:model.supports_reference?(refData||undefined):undefined})}));
+    const job=await jsonResponse(await authFetch("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt,model:model.id,negative:model.supports_negative?$("negative").value:"",profile,resolution:Number(form.elements.resolution.value),reference:model.supports_reference?(refData||undefined):undefined})}));
     if(!job.id)throw new Error("ระบบไม่ส่งหมายเลขงานกลับมา");
     const waitText=model.id==="qwen-image-2.1"?({fast:"ประมาณ 1 นาที",medium:"ประมาณ 1-2 นาที",quality:"ประมาณ 2 นาที"}[job.profile]||"ประมาณ 1-2 นาที"):"อาจใช้เวลาหลายนาที";
     const modeName={fast:"เร็ว",medium:"ปานกลาง",quality:"เน้นคุณภาพ",standard:"มาตรฐาน"}[job.profile]||job.profile;
@@ -277,14 +301,16 @@ async function generate(event){
     setStatus("รับงานแล้ว · "+model.label+" · โหมด"+modeName+(model.supports_reference&&refData?" · ใช้รูปอ้างอิงใบหน้า":""));
     while(true){
       await new Promise(resolve=>setTimeout(resolve,3000));
-      const state=await jsonResponse(await fetch("/api/status/"+encodeURIComponent(job.id)));
+      const state=await jsonResponse(await authFetch("/api/status/"+encodeURIComponent(job.id)));
       if(state.prompt_enhanced)showEnhanced(state.prompt_enhanced);
       if(state.stage==="translating")setStatus("กำลังแปลคำบรรยายภาษาไทยเป็นภาษาอังกฤษ…");
       else if(state.stage==="freeing")setStatus("กำลังคืนหน่วยความจำจากการสนทนา เพื่อให้การ์ดจอว่างสำหรับสร้างภาพ…");
       else if(state.queue_ahead>0)setStatus("กำลังรอคิว… มีงานก่อนหน้าอีก "+state.queue_ahead+" งาน");
       else if(state.status==="running")setStatus("กำลังสร้างภาพ…");
       if(state.status==="done"){
-        const imageUrl="/api/image/"+encodeURIComponent(job.id);
+        const imageResponse=await authFetch("/api/image/"+encodeURIComponent(job.id));
+        if(!imageResponse.ok)throw new Error("ดึงภาพที่สร้างเสร็จไม่สำเร็จ");
+        const imageUrl=URL.createObjectURL(await imageResponse.blob());
         $("result").src=imageUrl;$("download").href=imageUrl;$("download").style.display="inline-block";show("result");
         const secs=state.finished&&state.ts?Math.round(state.finished-state.ts):Math.round((Date.now()-startedAt)/1000);
         setStatus("สร้างภาพเสร็จแล้ว · ใช้เวลา "+secs+" วินาที");break
@@ -297,7 +323,6 @@ async function generate(event){
 }
 form.addEventListener("submit",generate);
 $("model").addEventListener("change",applyModel);
-loadModels();
 $("ref-input").addEventListener("change",async event=>{
   const file=event.target.files&&event.target.files[0];
   if(!file)return;
@@ -318,7 +343,7 @@ $("tab-draw").addEventListener("click",()=>showPage("draw"));
 $("tab-chat").addEventListener("click",()=>showPage("chat"));
 async function loadChatModels(){
   try{
-    const data=await jsonResponse(await fetch("/api/chat/models",{cache:"no-store"}));
+    const data=await jsonResponse(await authFetch("/api/chat/models",{cache:"no-store"}));
     const select=$("chat-model");select.replaceChildren();
     for(const m of data.models){
       const option=document.createElement("option");
@@ -456,7 +481,7 @@ $("chat-form").addEventListener("submit",async event=>{
   const escHtml=s=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
   const notesHtml=()=>streamNotes.map(n=>'<span class="note">⚠ '+escHtml(n)+"</span>").join("");
   try{
-    const response=await fetch("/api/chat",{method:"POST",signal:chatAbort.signal,
+    const response=await authFetch("/api/chat",{method:"POST",signal:chatAbort.signal,
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({model,messages:[...chatHistory,{role:"user",content:text,images,docs}]})});
     if(!response.ok||!response.body){const data=await response.json().catch(()=>({}));throw new Error(data.error||"ส่งข้อความไม่สำเร็จ")}
@@ -497,6 +522,33 @@ $("chat-form").addEventListener("submit",async event=>{
     $("chat-log").scrollTop=$("chat-log").scrollHeight;
   }
 });
+/* ---- login gate ---- */
+let authToken=localStorage.getItem("thani_token")||null;
+function authHeaders(extra){const headers=Object.assign({},extra);if(authToken)headers.Authorization="Bearer "+authToken;return headers}
+function authFetch(url,options){const opts=Object.assign({},options);opts.headers=authHeaders(opts.headers);return fetch(url,opts).then(response=>{if(response.status===401)showLogin("เซสชันหมดอายุ กรุณาเข้าสู่ระบบอีกครั้ง");return response})}
+function showLogin(message){authToken=null;localStorage.removeItem("thani_token");$("login-gate").hidden=false;$("login-password").value="";$("login-err").textContent=message||"";setTimeout(()=>$("login-password").focus(),50)}
+$("login-form").addEventListener("submit",async event=>{
+  event.preventDefault();
+  const btn=$("login-btn");btn.disabled=true;$("login-err").textContent="";
+  try{
+    const response=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:$("login-password").value})});
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.error||"เข้าสู่ระบบไม่สำเร็จ");
+    authToken=data.token;localStorage.setItem("thani_token",authToken);
+    $("login-gate").hidden=true;$("login-password").value="";
+    loadModels();
+  }catch(error){$("login-err").textContent=error.message}
+  finally{btn.disabled=false}
+});
+async function checkSession(){
+  if(!authToken){showLogin();return}
+  try{
+    const response=await fetch("/api/session",{headers:authHeaders()});
+    if(response.ok){$("login-gate").hidden=true;loadModels();return}
+  }catch{}
+  showLogin();
+}
+checkSession();
 </script>
 </body>
 </html>

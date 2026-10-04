@@ -492,6 +492,15 @@ class WarmModelTest(unittest.TestCase):
                 draw_server.warm_chat_model("qwen3:8b")
 
 
+def login(base):
+    """Exchange the shared password for a bearer token against a live server."""
+    request = urllib.request.Request(
+        base + "/api/login", json.dumps({"password": draw_server.DRAW_PASSWORD}).encode(),
+        {"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)["token"]
+
+
 class ChatHttpTest(unittest.TestCase):
     def setUp(self):
         draw_server.JOBS.clear()
@@ -499,6 +508,7 @@ class ChatHttpTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.auth = {"Authorization": "Bearer " + login(self.base)}
         self.tags = mock.patch.object(draw_server, "ollama_tags", return_value=[
             {"model": "qwen3:8b", "capabilities": ["completion", "thinking"]},
             {"model": "vl:4b", "capabilities": ["completion", "vision"]},
@@ -512,9 +522,12 @@ class ChatHttpTest(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         draw_server.JOBS.clear()
+        draw_server.SESSIONS.clear()
 
     def test_models_endpoint_filters_embeddings_and_flags_vision(self):
-        with urllib.request.urlopen(self.base + "/api/chat/models") as response:
+        request = urllib.request.Request(self.base + "/api/chat/models",
+                                         headers=self.auth)
+        with urllib.request.urlopen(request) as response:
             data = json.load(response)
         self.assertEqual([m["id"] for m in data["models"]], ["qwen3:8b", "vl:4b"])
         self.assertEqual([m["vision"] for m in data["models"]], [False, True])
@@ -533,7 +546,7 @@ class ChatHttpTest(unittest.TestCase):
     def chat_post(self, body):
         request = urllib.request.Request(
             self.base + "/api/chat", json.dumps(body).encode(),
-            {"Content-Type": "application/json"}, method="POST")
+            {"Content-Type": "application/json", **self.auth}, method="POST")
         return urllib.request.urlopen(request, timeout=5)
 
     def test_chat_streams_deltas_and_user_content(self):
@@ -904,6 +917,7 @@ class DrawHttpTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.auth = {"Authorization": "Bearer " + login(self.base)}
         self.available = mock.patch.object(draw_server, "available_models", return_value={
             draw_server.DEFAULT_MODEL_ID: True, draw_server.FLUX_MODEL_ID: True})
         self.available.start()
@@ -914,15 +928,20 @@ class DrawHttpTest(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         draw_server.JOBS.clear()
+        draw_server.SESSIONS.clear()
 
     def post(self, body):
         request = urllib.request.Request(
             self.base + "/api/generate", body,
-            {"Content-Type": "application/json"}, method="POST")
+            {"Content-Type": "application/json", **self.auth}, method="POST")
         return urllib.request.urlopen(request, timeout=2)
 
+    def get(self, path):
+        request = urllib.request.Request(self.base + path, headers=self.auth)
+        return urllib.request.urlopen(request, timeout=5)
+
     def test_catalog_and_model_selection(self):
-        with urllib.request.urlopen(self.base + "/api/models") as response:
+        with self.get("/api/models") as response:
             catalog = json.load(response)
         self.assertEqual(catalog["default"], draw_server.DEFAULT_MODEL_ID)
         self.assertIn("prompt_enhancer", catalog)
@@ -975,14 +994,14 @@ class DrawHttpTest(unittest.TestCase):
         draw_server.JOBS["jq"] = {"status": "running", "prompt_id": "p1", "ts": time.time()}
         queue = {"queue_running": [[1, "other"]], "queue_pending": [[2, "p2"], [3, "p1"]]}
         with mock.patch.object(draw_server, "comfy_get", return_value=queue):
-            with urllib.request.urlopen(self.base + "/api/status/jq") as response:
+            with self.get("/api/status/jq") as response:
                 data = json.load(response)
         self.assertEqual(data["queue_ahead"], 2)
 
         draw_server.JOBS["jd"] = {"status": "done", "prompt_id": "p9", "ts": 1.0,
                                   "started": 1.5, "finished": 2.0}
         with mock.patch.object(draw_server, "comfy_get") as comfy_get:
-            with urllib.request.urlopen(self.base + "/api/status/jd") as response:
+            with self.get("/api/status/jd") as response:
                 data = json.load(response)
         comfy_get.assert_not_called()
         self.assertNotIn("queue_ahead", data)
@@ -1001,6 +1020,59 @@ class DrawHttpTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.post(b'{"prompt":"\xff"}')
         self.assertEqual(error.exception.code, 400)
+        error.exception.close()
+
+
+class LoginFlowTest(unittest.TestCase):
+    def setUp(self):
+        self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        draw_server.SESSIONS.clear()
+
+    def post_json(self, path, body, headers=None):
+        request = urllib.request.Request(
+            self.base + path, json.dumps(body).encode(),
+            {"Content-Type": "application/json", **(headers or {})}, method="POST")
+        return urllib.request.urlopen(request, timeout=5)
+
+    def test_login_rejects_wrong_password(self):
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post_json("/api/login", {"password": "not-the-password"})
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+        self.assertFalse(draw_server.SESSIONS)
+
+    def test_api_locked_without_token_and_opened_by_login(self):
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(self.base + "/api/models")
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+
+        with self.post_json("/api/login", {"password": draw_server.DRAW_PASSWORD}) as response:
+            data = json.load(response)
+        self.assertTrue(data["token"])
+        auth = {"Authorization": "Bearer " + data["token"]}
+
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post_json("/api/generate", {"prompt": "bird"})
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+
+        request = urllib.request.Request(self.base + "/api/session", headers=auth)
+        with urllib.request.urlopen(request) as response:
+            self.assertTrue(json.load(response)["ok"])
+
+        request = urllib.request.Request(self.base + "/api/session")
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        self.assertEqual(error.exception.code, 401)
         error.exception.close()
 
 
