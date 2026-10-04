@@ -71,6 +71,12 @@ FLUX_MODEL_ID = "flux.2-klein-4b"
 RESOLUTIONS = [512, 640, 768, 896, 1024]
 DEFAULT_NEGATIVE = ""
 JOB_TIMEOUT = 900  # seconds
+# YuE2 text-to-song runs through the same ComfyUI instance as image jobs.
+# The int8 checkpoint fits a 12GB card; a full song is much slower than an
+# image, so music jobs get their own, larger timeout.
+YUE2_CHECKPOINT = os.environ.get("YUE2_CHECKPOINT", "yue2_3b_int8_convrot.safetensors")
+MUSIC_JOB_TIMEOUT = 3600  # seconds
+MUSIC_MAX_SECONDS = 240
 MAX_BODY = 12 * 1024 * 1024  # allows a base64 reference image
 MAX_REFERENCE = 10 * 1024 * 1024
 # Qwen-Image-2.1 is distilled. The ComfyUI template samples euler/simple at
@@ -767,6 +773,7 @@ def build_chat_messages(payload, image_limit=CHAT_MAX_IMAGES):
 def model_catalog():
     available = available_models()
     return {"default": DEFAULT_MODEL_ID, "prompt_enhancer": bool(ENRICHER_URL),
+            "music_available": music_available(),
             "models": [
         {"id": model_id, "label": spec["label"], "available": available[model_id],
          "profiles": spec["profiles"], "default_profile": spec["default_profile"],
@@ -846,6 +853,91 @@ def build_graph(prompt, negative, resolution, seed, profile, reference=None,
     if model_id == FLUX_MODEL_ID:
         return build_flux_graph(prompt, resolution, seed)
     raise ValueError("unknown model")
+
+
+def music_available():
+    return (MODEL_ROOT / "checkpoints" / YUE2_CHECKPOINT).exists()
+
+
+def build_yue2_graph(style, lyrics, seconds, seed, planning=True):
+    """Text-to-song graph mirroring the ComfyUI 'Text to Music (YuE2)' template."""
+    graph = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {
+            "ckpt_name": YUE2_CHECKPOINT}},
+        "3": {"class_type": "YuE2GenerateMusic", "inputs": {
+            "clip": ["1", 1], "style": style, "lyrics": lyrics, "abc": "",
+            "seed": seed, "mode": "full", "max_duration": float(seconds),
+            "temperature": 1.0, "top_p": 0.95, "top_k": 100,
+            "repetition_penalty": 1.2}},
+        "4": {"class_type": "ConditioningZeroOut", "inputs": {
+            "conditioning": ["3", 0]}},
+        "5": {"class_type": "EmptyYuE2LatentAudio", "inputs": {
+            "seconds": ["3", 1], "batch_size": 1}},
+        "6": {"class_type": "KSampler", "inputs": {
+            "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0],
+            "latent_image": ["5", 0], "seed": seed, "steps": 32, "cfg": 1.0,
+            "sampler_name": "dpm_2", "scheduler": "sgm_uniform", "denoise": 1.0}},
+        "7": {"class_type": "VAEDecodeAudio", "inputs": {
+            "samples": ["6", 0], "vae": ["1", 2]}},
+        "8": {"class_type": "SaveAudioMP3", "inputs": {
+            "audio": ["7", 0], "filename_prefix": "music/thanipitak",
+            "quality": "V0"}},
+    }
+    if planning:  # ABC plan (melody + chords) steers the music pass
+        graph["2"] = {"class_type": "YuE2GenerateABC", "inputs": {
+            "clip": ["1", 1], "style": style, "lyrics": lyrics, "seed": seed,
+            "mode": "full", "max_abc_tokens": 8192, "temperature": 0.7,
+            "top_p": 0.9, "top_k": 30, "repetition_penalty": 1.005,
+            "penalty_window": 100}}
+        graph["3"]["inputs"]["abc"] = ["2", 0]
+    return graph
+
+
+def run_music_job(job_id, spec):
+    try:
+        with LOCK:
+            JOBS[job_id]["stage"] = "freeing"
+        release_ollama_vram()  # YuE2 shares the 12GB card with the chat model
+        with LOCK:
+            JOBS[job_id]["stage"] = "composing"
+        graph = build_yue2_graph(spec["style"], spec["lyrics"], spec["seconds"],
+                                 spec["seed"], spec["planning"])
+        resp = comfy_post("/prompt", {"prompt": graph, "client_id": job_id})
+        pid = resp.get("prompt_id")
+        if not pid:
+            raise RuntimeError("comfy rejected prompt: " + json.dumps(resp)[:300])
+        with LOCK:
+            JOBS[job_id]["prompt_id"] = pid
+            JOBS[job_id]["status"] = "running"
+            JOBS[job_id]["started"] = time.time()
+        deadline = time.time() + MUSIC_JOB_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(3)
+            history = comfy_get(f"/history/{pid}")
+            if history == {}:
+                continue
+            item = next(iter(history.values()))
+            status = item.get("status", {})
+            if status.get("status_str") == "error":
+                msgs = [m for m in status.get("messages", []) if m[0] == "execution_error"]
+                detail = json.dumps(msgs[-1])[:400] if msgs else "comfy execution error"
+                raise RuntimeError(detail)
+            if status.get("completed"):
+                for output in item.get("outputs", {}).values():
+                    for audio in output.get("audio", output.get("images", [])):
+                        if audio.get("type") == "output":
+                            with LOCK:
+                                JOBS[job_id]["file"] = audio["filename"]
+                                JOBS[job_id]["subfolder"] = audio.get("subfolder", "")
+                                JOBS[job_id]["status"] = "done"
+                                JOBS[job_id]["finished"] = time.time()
+                            return
+                raise RuntimeError("finished but no output audio found")
+        raise RuntimeError("timeout waiting for ComfyUI")
+    except Exception as e:  # surface the failure to the browser
+        with LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = str(e)[:500]
 
 
 def run_job(job_id, spec, ref_path=None):
@@ -1103,6 +1195,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "image file missing"})
                 return
             self._send(200, data, "image/png")
+        elif route.startswith("/api/audio/"):
+            jid = route.rsplit("/", 1)[-1]
+            with LOCK:
+                job = JOBS.get(jid, {})
+                filename = job.get("file")
+                subfolder = job.get("subfolder", "")
+            if job.get("status") != "done" or not filename:
+                self._send(404, {"error": "audio not ready"})
+                return
+            target = (OUTPUT_DIR / subfolder / filename) if subfolder \
+                else (OUTPUT_DIR / filename)
+            try:
+                data = target.read_bytes()
+            except OSError:
+                self._send(404, {"error": "audio file missing"})
+                return
+            self._send(200, data, "audio/mpeg", cache="no-cache")
         else:
             self._send(404, {"error": "not found"})
 
@@ -1116,6 +1225,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/chat":
             self._handle_chat()
+            return
+        if route == "/api/music/generate":
+            self._handle_music()
             return
         if route != "/api/generate":
             self._send(404, {"error": "not found"})
@@ -1191,6 +1303,55 @@ class Handler(BaseHTTPRequestHandler):
                 JOBS.pop(old, None)
         threading.Thread(target=run_job, args=(job_id, spec, ref_path), daemon=True).start()
         self._send(200, {"id": job_id, "profile": profile, "model": model_id})
+
+    def _handle_music(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > MAX_BODY:
+                raise ValueError("invalid body length")
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("invalid body")
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            self._send(400, {"error": "invalid json"})
+            return
+        if not music_available():
+            self._send(503, {"error": "ยังไม่ได้ติดตั้งโมเดลสร้างเพลง (YuE2)"})
+            return
+        style = str(body.get("style", "")).strip()
+        if not style or len(style) > 800:
+            self._send(400, {"error": "กรุณาใส่สไตล์เพลง (ไม่เกิน 800 ตัวอักษร)"})
+            return
+        lyrics = str(body.get("lyrics", "")).strip()
+        if len(lyrics) > 8000:
+            self._send(400, {"error": "เนื้อร้องยาวเกิน 8000 ตัวอักษร"})
+            return
+        try:
+            seconds = int(body.get("seconds") or 60)
+            raw_seed = body.get("seed")
+            if raw_seed in (None, ""):
+                seed = time.time_ns() % (2 ** 31)
+            else:
+                seed = int(raw_seed)
+            if seed < 0:
+                seed = abs(seed)
+        except (TypeError, ValueError):
+            self._send(400, {"error": "invalid music option"})
+            return
+        if not 15 <= seconds <= MUSIC_MAX_SECONDS:
+            self._send(400, {"error": f"ความยาวต้องอยู่ระหว่าง 15-{MUSIC_MAX_SECONDS} วินาที"})
+            return
+        planning = body.get("planning", True) is not False
+        job_id = uuid.uuid4().hex[:12]
+        with LOCK:
+            JOBS[job_id] = {"status": "queued", "kind": "music", "ts": time.time()}
+            for old in [j for j, v in JOBS.items()
+                        if time.time() - v["ts"] > 4 * 3600]:
+                JOBS.pop(old, None)
+        threading.Thread(target=run_music_job, args=(job_id, {
+            "style": style, "lyrics": lyrics, "seconds": seconds,
+            "seed": seed, "planning": planning}), daemon=True).start()
+        self._send(200, {"id": job_id, "seed": seed})
 
     def _handle_chat(self):
         try:

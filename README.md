@@ -1,6 +1,6 @@
-# Thanipitak Agent — Local AI image generation + webchat
+# Thanipitak Agent — Local AI image generation + webchat + music
 
-เว็บสองโหมด: สร้างภาพจากข้อความภาษาไทยหรืออังกฤษผ่าน ComfyUI (Qwen-Image-2.1 และ FLUX.2 [klein]) และสนทนาแบบ webchat กับโมเดล local ผ่าน Ollama พร้อมแนบเอกสาร (PDF, DOCX, XLSX, TXT) และรูปภาพ (PNG, JPG) มาถามได้ โครงการนี้แยกจากระบบผู้ช่วยสนทนาธานีพิทักษ์และใช้ Python standard library สำหรับเว็บเซิร์ฟเวอร์
+เว็บสามโหมด: สร้างภาพจากข้อความภาษาไทยหรืออังกฤษผ่าน ComfyUI (Qwen-Image-2.1 และ FLUX.2 [klein]), แต่งเพลงจากสไตล์และเนื้อร้องด้วย YuE2-3B ผ่าน ComfyUI และสนทนาแบบ webchat กับโมเดล local ผ่าน Ollama พร้อมแนบเอกสาร (PDF, DOCX, XLSX, TXT) และรูปภาพ (PNG, JPG) มาถามได้ โครงการนี้แยกจากระบบผู้ช่วยสนทนาธานีพิทักษ์และใช้ Python standard library สำหรับเว็บเซิร์ฟเวอร์
 
 ## เริ่มต้น
 
@@ -49,6 +49,7 @@ Qwen-Image เข้าใจคำบรรยายภาษาอังกฤ
 - `GET /api/session` ตรวจความถูกต้องของ token
 - `GET /api/health` และ `GET /api/models`
 - `POST /api/generate` รับ `prompt`, `model`, `profile`, `resolution` และตัวเลือกที่โมเดลรองรับ แล้วคืนรหัสงานทันที
+- `POST /api/music/generate` รับ `style`, `lyrics`, `seconds`, `planning`, `seed` แล้วคืนรหัสงาน; `GET /api/audio/<id>` ดาวน์โหลด MP3
 - `GET /api/status/<id>` ตรวจสถานะงาน
 - `GET /api/image/<id>` ดาวน์โหลด PNG เมื่อเสร็จ
 
@@ -59,6 +60,16 @@ Qwen-Image เข้าใจคำบรรยายภาษาอังกฤ
 ```
 
 งานสร้างภาพทำงานเบื้องหลังและให้หน้าเว็บตรวจสถานะเป็นระยะ จึงไม่ต้องเปิดคำขอ HTTP ค้างไว้ระหว่าง ComfyUI สร้างภาพ
+
+## สร้างเพลง (YuE2)
+
+แท็บ "สร้างเพลง" แต่งเพลงจากสไตล์เพลงและเนื้อร้องผ่านโมเดล YuE2-3B ที่รันบน ComfyUI เดียวกับงานสร้างภาพ โมเดลใช้ไฟล์ `yue2_3b_int8_convrot.safetensors` (Comfy-Org แพ็ก ติดตั้งใน `models/checkpoints/` ปรับชื่อไฟล์ด้วย `YUE2_CHECKPOINT`) งานเพลงจะขอคืน VRAM จากโมเดลแชตก่อนเริ่มทุกครั้ง
+
+- ใส่สไตล์ (ภาษา เสียงร้อง แนวเพลง BPM เครื่องดนตรี) เนื้อร้องแบบแท็ก `[Verse]` `[Chorus]` (เว้นว่าง = เครื่องดนตรีล้วน) ความยาว 15-240 วินาที และเปิด/ปิดการวางแผนทำนอง (ABC planning) ได้
+- เปิด ABC planning จะพ่นโน้ตทำนอง+คอร์ดก่อนแล้วสร้างเสียงตามแผน ทำนองควบคุมได้ดีกว่าแต่ช้ากว่า
+- ผลลัพธ์เป็น MP3 48kHz stereo เล่นในหน้าเว็บและกดดาวน์โหลดได้
+
+API: `POST /api/music/generate` รับ `{"style", "lyrics", "seconds", "planning", "seed"}` คืนรหัสงาน ตรวจสถานะด้วย `GET /api/status/<id>` เหมือนงานภาพ และดาวน์โหลดไฟล์ด้วย `GET /api/audio/<id>` บนการ์ด RTX 3060 เพลง 30 วินาที (เปิด planning) ใช้เวลาราว 30 วินาที — เพลงยาวใช้เวลามากขึ้นตามจำนวนวินาที
 
 ## Webchat (Ollama)
 

@@ -1023,6 +1023,95 @@ class DrawHttpTest(unittest.TestCase):
         error.exception.close()
 
 
+class MusicGraphTest(unittest.TestCase):
+    def test_graph_follows_yue2_template(self):
+        graph = draw_server.build_yue2_graph(
+            "pop ballad", "[Verse]\nhello", 60, 123, planning=True)
+        self.assertEqual(graph["1"]["class_type"], "CheckpointLoaderSimple")
+        self.assertEqual(graph["1"]["inputs"]["ckpt_name"], draw_server.YUE2_CHECKPOINT)
+        self.assertEqual(graph["2"]["class_type"], "YuE2GenerateABC")
+        self.assertEqual(graph["3"]["inputs"]["abc"], ["2", 0])
+        self.assertEqual(graph["3"]["inputs"]["max_duration"], 60.0)
+        self.assertEqual(graph["5"]["inputs"]["seconds"], ["3", 1])
+        sampler = graph["6"]["inputs"]
+        self.assertEqual((sampler["steps"], sampler["cfg"],
+                          sampler["sampler_name"], sampler["scheduler"]), (32, 1.0, "dpm_2", "sgm_uniform"))
+        self.assertEqual(sampler["negative"], ["4", 0])
+        self.assertEqual(graph["8"]["class_type"], "SaveAudioMP3")
+
+    def test_graph_without_planning_skips_abc_node(self):
+        graph = draw_server.build_yue2_graph(
+            "lofi", "", 30, 7, planning=False)
+        self.assertNotIn("2", graph)
+        self.assertEqual(graph["3"]["inputs"]["abc"], "")
+
+
+class MusicHttpTest(unittest.TestCase):
+    def setUp(self):
+        draw_server.JOBS.clear()
+        self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.auth = {"Authorization": "Bearer " + login(self.base)}
+        self.music_on = mock.patch.object(draw_server, "music_available", return_value=True)
+        self.music_on.start()
+
+    def tearDown(self):
+        self.music_on.stop()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        draw_server.JOBS.clear()
+        draw_server.SESSIONS.clear()
+
+    def post_music(self, body):
+        request = urllib.request.Request(
+            self.base + "/api/music/generate", json.dumps(body).encode(),
+            {"Content-Type": "application/json", **self.auth}, method="POST")
+        return urllib.request.urlopen(request, timeout=5)
+
+    def test_generate_queues_job_and_reports_music_catalog(self):
+        with urllib.request.urlopen(urllib.request.Request(
+                self.base + "/api/models", headers=self.auth)) as response:
+            catalog = json.load(response)
+        self.assertTrue(catalog["music_available"])
+        with mock.patch.object(draw_server, "run_music_job") as run_music:
+            with self.post_music({"style": "pop", "lyrics": "[Verse]\nla",
+                                  "seconds": 30, "planning": False,
+                                  "seed": 5}) as response:
+                job = json.load(response)
+        self.assertTrue(job["id"])
+        self.assertEqual(job["seed"], 5)
+        for _ in range(50):
+            if run_music.called:
+                break
+            time.sleep(0.01)
+        spec = run_music.call_args.args[1]
+        self.assertEqual(spec, {"style": "pop", "lyrics": "[Verse]\nla",
+                                "seconds": 30, "seed": 5, "planning": False})
+
+    def test_validation_and_missing_model_fail_before_queue(self):
+        with mock.patch.object(draw_server, "run_music_job") as run_music:
+            for body in [{"lyrics": "no style"},
+                         {"style": "x" * 801},
+                         {"style": "pop", "seconds": 10},
+                         {"style": "pop", "seconds": 9999}]:
+                with self.subTest(body=body), \
+                        self.assertRaises(urllib.error.HTTPError) as error:
+                    self.post_music(body)
+                self.assertEqual(error.exception.code, 400)
+                error.exception.close()
+        run_music.assert_not_called()
+        self.assertFalse(draw_server.JOBS)
+
+        self.music_on.stop()
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post_music({"style": "pop"})
+        self.assertEqual(error.exception.code, 503)
+        error.exception.close()
+
+
 class LoginFlowTest(unittest.TestCase):
     def setUp(self):
         self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
