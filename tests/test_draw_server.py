@@ -1106,8 +1106,9 @@ class MusicHttpTest(unittest.TestCase):
         self.assertFalse(draw_server.JOBS)
 
         self.music_on.stop()
-        with self.assertRaises(urllib.error.HTTPError) as error:
-            self.post_music({"style": "pop"})
+        with mock.patch.object(draw_server, "music_available", return_value=False):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post_music({"style": "pop"})
         self.assertEqual(error.exception.code, 503)
         error.exception.close()
 
