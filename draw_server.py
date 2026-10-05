@@ -1419,6 +1419,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._send(503, {"error": "ollama ไม่พร้อมใช้งาน"})
             return
+        # Ollama resolves a bare name to its :latest tag; accept both spellings
+        # so curl callers match what chat_num_ctx already accepts.
+        if model_id not in known and ":" not in model_id \
+                and f"{model_id}:latest" in known:
+            model_id = f"{model_id}:latest"
         if model_id not in known:
             self._send(400, {"error": "ไม่พบโมเดลนี้"})
             return

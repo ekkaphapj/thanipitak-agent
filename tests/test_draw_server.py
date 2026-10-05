@@ -664,6 +664,30 @@ class ChatHttpTest(unittest.TestCase):
         rows = [json.loads(l) for l in streamed.splitlines() if l.strip()]
         self.assertEqual(rows[-2]["usage"]["ctx"], 4096)
 
+    def test_untagged_model_id_resolves_to_latest(self):
+        lines = [
+            {"message": {"content": "ok"}, "done": False},
+            {"message": {"content": ""}, "done": True, "eval_count": 1},
+        ]
+        body = {"model": "typhoon2-8b",
+                "messages": [{"role": "user", "content": "hi"}]}
+        with mock.patch.object(draw_server, "ollama_tags", return_value=[
+                {"model": "typhoon2-8b:latest", "capabilities": ["completion"]}]), \
+             self.ollama_mock(lines) as urlopen, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True), \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"):
+            with self.chat_post(body) as response:
+                response.read()
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["model"], "typhoon2-8b:latest")
+
+    def test_unknown_model_is_rejected(self):
+        body = {"model": "nope", "messages": [{"role": "user", "content": "hi"}]}
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.chat_post(body)
+        self.assertEqual(caught.exception.code, 400)
+
     def test_heartbeat_keeps_connection_alive_while_ollama_is_silent(self):
         class SlowStream:
             def __enter__(self):
