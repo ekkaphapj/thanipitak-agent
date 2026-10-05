@@ -38,6 +38,9 @@ textarea{min-height:145px;resize:vertical}textarea::placeholder{color:#888486}
 .chips{display:flex;flex-wrap:wrap;gap:8px}
 .chip{padding:8px 11px;border:1px solid #514749;border-radius:999px;background:#2b2729;color:#e8dfe0;font-size:12px;cursor:pointer}
 .chip:hover{border-color:#bb5a55;background:#382729}
+.chip.active{border-color:#e0655c;background:#a03c36;color:#fff}
+.chip-row{display:flex;align-items:flex-start;gap:10px;margin-top:8px}
+.chip-label{flex:0 0 auto;width:76px;font-size:12px;color:#b7a9ab;padding-top:9px}
 .ref-row{display:flex;gap:14px;align-items:center}.ref-row img{display:none;width:92px;height:92px;object-fit:cover;border-radius:12px;border:1px solid #575052}
 .upload-btn{display:inline-flex;align-items:center;gap:8px;padding:11px 14px;border:1px solid #575052;border-radius:11px;background:#19191b;color:#e8dfe0;font-size:13px;cursor:pointer}
 .upload-btn:hover{border-color:#bb5a55;background:#2b2729}.upload-btn input{display:none}
@@ -262,11 +265,22 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
       <div class="music-side">
         <label for="music-style">สไตล์เพลง <span class="required" aria-hidden="true">*</span></label>
         <textarea id="music-style" required maxlength="800" style="min-height:110px" placeholder="เช่น English, warm female vocal, acoustic pop, 92 BPM, acoustic guitar, soft piano"></textarea>
-        <p class="hint">บอกภาษา ประเภทเสียงร้อง แนวเพลง จังหวะ (BPM) และเครื่องดนตรี — ตัวอย่างเพิ่มด้านล่าง</p>
-        <div class="examples"><span class="examples-title">ลองเริ่มจากตัวอย่าง</span><div class="chips">
-          <button class="chip" type="button" data-style="Thai, warm male vocal, acoustic pop ballad, 88 BPM, acoustic guitar, soft strings, gentle percussion">ป๊อบไทยอคูสติก</button>
-          <button class="chip" type="button" data-style="English, energetic female vocal, synth-pop, 120 BPM, bright synths, punchy drums, bass">ซินธ์ป๊อบไทม์ใหม่</button>
-          <button class="chip" type="button" data-style="Instrumental, calm lo-fi hip hop, 75 BPM, mellow piano, vinyl texture, soft drums">โลไฟไม่มีเนื้อร้อง</button>
+        <p class="hint">เลือกแนวเพลง เสียงร้อง และจังหวะจากปุ่ม — ระบบจะประกอบเป็นสไตล์ให้อัตโนมัติ แก้ข้อความเองเพิ่มได้</p>
+        <div class="chip-row" role="group" aria-label="แนวเพลง"><span class="chip-label">แนวเพลง</span><div class="chips">
+          <button class="chip" type="button" data-genre="Thai, marching band anthem, powerful brass section, rolling snare drums, uplifting and motivational, school spirit">เพลงมาร์ช/ปลุกใจ</button>
+          <button class="chip" type="button" data-genre="Thai, cheerful upbeat pop, bright synths, bouncy bassline, catchy hooks, feel-good energy">เพลง Pop สนุกๆ</button>
+          <button class="chip" type="button" data-genre="Thai, hard-hitting rock, powerful electric guitars, driving heavy drums, raw energy, guitar solo">เพลงร็อค</button>
+          <button class="chip" type="button" data-genre="Thai, phuea chiwit folk rock, acoustic guitar, heartfelt storytelling, warm down-to-earth feeling">เพลงเพื่อชีวิต</button>
+        </div></div>
+        <div class="chip-row" role="group" aria-label="เสียงร้อง"><span class="chip-label">เสียงร้อง</span><div class="chips">
+          <button class="chip" type="button" data-vocal="male vocal">ผู้ชาย</button>
+          <button class="chip" type="button" data-vocal="female vocal">ผู้หญิง</button>
+          <button class="chip" type="button" data-vocal="male and female duet vocals">คู่</button>
+        </div></div>
+        <div class="chip-row" role="group" aria-label="จังหวะเพลง"><span class="chip-label">จังหวะเพลง</span><div class="chips">
+          <button class="chip" type="button" data-tempo="slow tempo, 70 BPM">ช้า</button>
+          <button class="chip" type="button" data-tempo="medium tempo, 95 BPM">ปานกลาง</button>
+          <button class="chip" type="button" data-tempo="fast tempo, 130 BPM, energetic">เพลงเร็ว</button>
         </div></div>
       </div>
       <div class="music-side">
@@ -578,7 +592,19 @@ $("chat-form").addEventListener("submit",async event=>{
 /* ---- music tab (YuE2 text-to-song) ---- */
 let musicBusy=false,musicStartedAt=0;
 function setMusicStatus(message,error=false){const el=$("music-status");el.textContent=message;el.style.color=error?"#ff8f88":""}
-document.querySelectorAll("[data-style]").forEach(button=>button.addEventListener("click",()=>{$("music-style").value=button.dataset.style;$("music-style").focus()}));
+const musicPick={genre:null,vocal:null,tempo:null};
+function renderMusicPick(){
+  document.querySelectorAll("#music-page [data-genre],#music-page [data-vocal],#music-page [data-tempo]").forEach(button=>{
+    const kind=button.dataset.genre!==undefined?"genre":button.dataset.vocal!==undefined?"vocal":"tempo";
+    button.classList.toggle("active",musicPick[kind]===button.dataset[kind]);
+  });
+  $("music-style").value=[musicPick.genre,musicPick.vocal,musicPick.tempo].filter(Boolean).join(", ");
+}
+document.querySelectorAll("#music-page [data-genre],#music-page [data-vocal],#music-page [data-tempo]").forEach(button=>button.addEventListener("click",()=>{
+  const kind=button.dataset.genre!==undefined?"genre":button.dataset.vocal!==undefined?"vocal":"tempo";
+  musicPick[kind]=musicPick[kind]===button.dataset[kind]?null:button.dataset[kind];
+  renderMusicPick();$("music-style").focus();
+}));
 $("music-form").addEventListener("submit",async event=>{
   event.preventDefault();
   if(musicBusy||!musicReady)return;
