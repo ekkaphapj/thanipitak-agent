@@ -41,6 +41,8 @@ textarea{min-height:145px;resize:vertical}textarea::placeholder{color:#888486}
 .chip.active{border-color:#e0655c;background:#a03c36;color:#fff}
 .chip-row{display:flex;align-items:flex-start;gap:10px;margin-top:8px}
 .chip-label{flex:0 0 auto;width:76px;font-size:12px;color:#b7a9ab;padding-top:9px}
+.seed-row{display:flex;gap:8px;margin-top:6px;align-items:stretch}
+.seed-row input{flex:1;min-width:0}
 .ref-row{display:flex;gap:14px;align-items:center}.ref-row img{display:none;width:92px;height:92px;object-fit:cover;border-radius:12px;border:1px solid #575052}
 .upload-btn{display:inline-flex;align-items:center;gap:8px;padding:11px 14px;border:1px solid #575052;border-radius:11px;background:#19191b;color:#e8dfe0;font-size:13px;cursor:pointer}
 .upload-btn:hover{border-color:#bb5a55;background:#2b2729}.upload-btn input{display:none}
@@ -296,10 +298,20 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
           <option value="240">4 นาที</option>
         </select>
         <label class="hint" style="display:flex;gap:8px;align-items:center;margin-top:14px;cursor:pointer"><input type="checkbox" id="music-planning" checked style="width:auto"> วางแผนทำนอง+คอร์ดก่อน (ABC planning — ทำนองดีขึ้น แต่ใช้เวลามากขึ้น)</label>
+        <label for="music-seed" style="margin-top:14px">Seed (เว้นว่าง = สุ่มใหม่ทุกครั้ง)</label>
+        <div class="seed-row">
+          <input id="music-seed" type="number" min="0" step="1" inputmode="numeric" placeholder="สุ่มอัตโนมัติ">
+          <button class="chip" type="button" id="music-seed-last" hidden>ใช้ seed ล่าสุด</button>
+        </div>
+        <p class="hint" id="music-seed-hint" hidden style="margin-top:6px"></p>
       </div>
     </div>
     <button class="primary" id="music-btn" type="submit" disabled><span aria-hidden="true">♪</span> สร้างเพลง</button>
-    <p class="privacy">เพลงสร้างบนการ์ดจอในเครื่อง · ยิ่งยาวยิ่งใช้เวลานาน · ระบบสุ่ม seed ใหม่ทุกครั้ง</p>
+    <p class="privacy">เพลงสร้างบนการ์ดจอในเครื่อง · ยิ่งยาวยิ่งใช้เวลานาน · เว้นช่อง seed ว่างเพื่อสุ่มใหม่ทุกครั้ง</p>
+    <div class="chips" style="margin-top:4px">
+      <button class="chip" type="button" id="music-clear">🧹 ล้างหน่วยความจำ GPU</button>
+    </div>
+    <p class="hint" style="margin-top:6px">ถ้าสร้างเพลงหรือรูปหลายครั้งต่อกันแล้วเครื่องเริ่มอืด กดปุ่มนี้เพื่อปล่อยโมเดลทั้งหมดออกจากการ์ดจอ</p>
   </form>
   <div class="music-result" id="music-result">
     <p id="music-status" role="status" aria-live="polite" style="margin:0 0 8px;color:#bcb6b8;font-size:13px;line-height:1.5">ยังไม่ได้สร้างเพลง</p>
@@ -605,18 +617,35 @@ document.querySelectorAll("#music-page [data-genre],#music-page [data-vocal],#mu
   musicPick[kind]=musicPick[kind]===button.dataset[kind]?null:button.dataset[kind];
   renderMusicPick();$("music-style").focus();
 }));
+let lastMusicSeed=null;
+$("music-seed-last").addEventListener("click",()=>{$("music-seed").value=lastMusicSeed;$("music-seed").focus()});
+$("music-clear").addEventListener("click",async()=>{
+  const btn=$("music-clear");btn.disabled=true;
+  setMusicStatus("กำลังล้างหน่วยความจำ GPU…");
+  try{
+    const response=await authFetch("/api/memory/clear",{method:"POST"});
+    const data=await response.json().catch(()=>({}));
+    if(response.status===409)setMusicStatus(data.error||"มีงานกำลังสร้างอยู่ ลองใหม่เมื่องานเสร็จ",true);
+    else if(!response.ok)throw new Error(data.error||"ล้างไม่สำเร็จ");
+    else setMusicStatus(data.comfy_freed?"ล้างหน่วยความจำ GPU แล้ว — ปล่อยโมเดล ComfyUI และ Ollama ออกจากการ์ดทั้งหมด":"ปล่อยโมเดล Ollama ออกจากการ์ดแล้ว (ฝั่ง ComfyUI ไม่มีโมเดลค้างหรือเชื่อมต่อไม่ถึง)");
+  }catch(error){setMusicStatus("ล้างหน่วยความจำไม่สำเร็จ: "+error.message,true)}
+  finally{btn.disabled=false}
+});
 $("music-form").addEventListener("submit",async event=>{
   event.preventDefault();
   if(musicBusy||!musicReady)return;
   const style=$("music-style").value.trim();
   if(!style){setMusicStatus("กรุณาใส่สไตล์เพลง",true);$("music-style").focus();return}
+  const rawSeed=$("music-seed").value.trim();
+  if(rawSeed&&!/^\d+$/.test(rawSeed)){setMusicStatus("Seed ต้องเป็นเลขจำนวนเต็มตั้งแต่ 0 ขึ้นไป",true);$("music-seed").focus();return}
   const btn=$("music-btn");musicBusy=true;btn.disabled=true;
   $("music-player").style.display="none";$("music-download").style.display="none";
   musicStartedAt=Date.now();
   setMusicStatus("กำลังส่งงานเข้าคิว… การแต่งเพลงใช้เวลาหลายนาที กรุณาเปิดหน้านี้ไว้");
   try{
-    const job=await jsonResponse(await authFetch("/api/music/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({style,lyrics:$("music-lyrics").value.trim(),seconds:Number($("music-seconds").value),planning:$("music-planning").checked})}));
+    const job=await jsonResponse(await authFetch("/api/music/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({style,lyrics:$("music-lyrics").value.trim(),seconds:Number($("music-seconds").value),planning:$("music-planning").checked,seed:rawSeed===""?undefined:Number(rawSeed)})}));
     if(!job.id)throw new Error("ระบบไม่ส่งหมายเลขงานกลับมา");
+    if(typeof job.seed==="number"){lastMusicSeed=job.seed;const hint=$("music-seed-hint");hint.textContent="seed ล่าสุด: "+job.seed+" — จะสร้างซ้ำแบบเดิมได้ถ้าสไตล์/เนื้อร้อง/ตัวเลือกเหมือนเดิม";hint.hidden=false;$("music-seed-last").hidden=false}
     setMusicStatus("รับงานแล้ว · กำลังคืนหน่วยความจำการ์ดจอแล้วเริ่มแต่งเพลง");
     while(true){
       await new Promise(resolve=>setTimeout(resolve,5000));

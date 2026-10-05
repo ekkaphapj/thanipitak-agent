@@ -1275,6 +1275,9 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/music/generate":
             self._handle_music()
             return
+        if route == "/api/memory/clear":
+            self._handle_memory_clear()
+            return
         if route != "/api/generate":
             self._send(404, {"error": "not found"})
             return
@@ -1398,6 +1401,23 @@ class Handler(BaseHTTPRequestHandler):
             "style": style, "lyrics": lyrics, "seconds": seconds,
             "seed": seed, "planning": planning}), daemon=True).start()
         self._send(200, {"id": job_id, "seed": seed})
+
+    def _handle_memory_clear(self):
+        """Unload every model from the GPU: ComfyUI first, then Ollama.
+
+        Refuses while ComfyUI is mid-job; if ComfyUI is unreachable there is
+        nothing to free there, so still unload Ollama and say so.
+        """
+        try:
+            queue = comfy_get("/queue")
+            if queue.get("queue_running"):
+                self._send(409, {"error": "มีงานสร้างภาพ/เพลงกำลังทำอยู่ รอให้เสร็จก่อนแล้วค่อยล้าง"})
+                return
+        except Exception:
+            pass  # ComfyUI down: its VRAM is gone with it, Ollama still holds models
+        comfy_freed = free_comfy_vram()
+        release_ollama_vram()
+        self._send(200, {"ok": True, "comfy_freed": comfy_freed})
 
     def _handle_chat(self):
         try:

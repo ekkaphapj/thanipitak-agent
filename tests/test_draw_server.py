@@ -1217,6 +1217,63 @@ class MusicHttpTest(unittest.TestCase):
         error.exception.close()
 
 
+class MemoryClearHttpTest(unittest.TestCase):
+    def setUp(self):
+        draw_server.JOBS.clear()
+        self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.auth = {"Authorization": "Bearer " + login(self.base)}
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        draw_server.JOBS.clear()
+        draw_server.SESSIONS.clear()
+
+    def post_clear(self):
+        request = urllib.request.Request(
+            self.base + "/api/memory/clear", b"", {**self.auth}, method="POST")
+        return urllib.request.urlopen(request, timeout=5)
+
+    def test_clears_comfy_and_ollama_when_idle(self):
+        with mock.patch.object(draw_server, "comfy_get",
+                               return_value={"queue_running": [], "queue_pending": []}), \
+             mock.patch.object(draw_server, "free_comfy_vram", return_value=True) as free, \
+             mock.patch.object(draw_server, "release_ollama_vram") as release:
+            with self.post_clear() as response:
+                data = json.load(response)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["comfy_freed"])
+        free.assert_called_once()
+        release.assert_called_once()
+
+    def test_refuses_while_comfy_busy(self):
+        with mock.patch.object(draw_server, "comfy_get",
+                               return_value={"queue_running": [1]}), \
+             mock.patch.object(draw_server, "free_comfy_vram") as free, \
+             mock.patch.object(draw_server, "release_ollama_vram") as release:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post_clear()
+        self.assertEqual(error.exception.code, 409)
+        error.exception.close()
+        free.assert_not_called()
+        release.assert_not_called()
+
+    def test_comfy_down_still_unloads_ollama(self):
+        with mock.patch.object(draw_server, "comfy_get", side_effect=OSError("down")), \
+             mock.patch.object(draw_server, "free_comfy_vram", return_value=False) as free, \
+             mock.patch.object(draw_server, "release_ollama_vram") as release:
+            with self.post_clear() as response:
+                data = json.load(response)
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["comfy_freed"])
+        free.assert_called_once()
+        release.assert_called_once()
+
+
 class LoginFlowTest(unittest.TestCase):
     def setUp(self):
         self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
