@@ -87,6 +87,7 @@ PDF ใช้ Poppler: โมเดล vision จะอ่านภาพหน�
 | Environment variable | ค่าเริ่มต้น | หน้าที่ |
 |---|---|---|
 | `CHAT_NUM_CTX` | `32768` | context ของ runner ทั้งตอน warm up และตอบ |
+| `CHAT_NUM_CTX_OVERRIDES` | (ว่าง) | json map ระบุ context ต่อโมเดล เช่น `'{"ministral3-14b-heresy": 16384}'` — ใช้เมื่อโมเดลใหญ่ที่ ctx ยาวล้น KV cache ไปอยู่บน RAM แล้ว generate ช้าลง ค่า ctx ที่ override มีผลทั้ง warm up, การตรวจ ready และมิเตอร์บนหน้าเว็บ |
 | `CHAT_KEEP_ALIVE` | `30m` | เวลาค้างโมเดลใน Ollama |
 | `CHAT_PDF_PAGES` | `6` | จำนวนหน้าแรกของ PDF ที่แปลงเป็นรูปต่อไฟล์ |
 | `CHAT_SHEET_ROWS` | `400` | จำนวนแถวที่มีข้อมูลสูงสุดต่อชีต |

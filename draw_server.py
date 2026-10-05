@@ -63,6 +63,31 @@ CHAT_TIMEOUT = 600
 CHAT_HEARTBEAT = 15  # seconds between keepalive lines while Ollama is silent
 CHAT_KEEP_ALIVE = os.environ.get("CHAT_KEEP_ALIVE", "30m")
 CHAT_NUM_CTX = int(os.environ.get("CHAT_NUM_CTX", "32768"))  # default 4k cuts long code
+# Per-model ctx overrides as a json map, e.g.
+#   CHAT_NUM_CTX_OVERRIDES='{"ministral3-14b-heresy": 16384}'
+# A 14B model at 32k ctx spills its KV cache onto the CPU on a 12GB card
+# and generates ~3x slower; a smaller ctx keeps it fully in VRAM.
+def _parse_ctx_overrides(raw):
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"CHAT_NUM_CTX_OVERRIDES is not valid json: {e}")
+    if not isinstance(data, dict):
+        raise SystemExit("CHAT_NUM_CTX_OVERRIDES must be a json object mapping model id to integer")
+    parsed = {}
+    for model_id, ctx in data.items():
+        if not isinstance(model_id, str) or not model_id:
+            raise SystemExit("CHAT_NUM_CTX_OVERRIDES keys must be non-empty model ids")
+        if isinstance(ctx, bool) or not isinstance(ctx, int) or ctx <= 0:
+            raise SystemExit(f"CHAT_NUM_CTX_OVERRIDES[{model_id!r}] must be a positive integer")
+        parsed[model_id] = ctx
+    return parsed
+
+
+CHAT_NUM_CTX_OVERRIDES = _parse_ctx_overrides(
+    os.environ.get("CHAT_NUM_CTX_OVERRIDES", ""))
 WARMUP_TIMEOUT = 300
 PDF_PAGES_MAX = int(os.environ.get("CHAT_PDF_PAGES", "6"))
 SHEET_ROWS_MAX = int(os.environ.get("CHAT_SHEET_ROWS", "400"))
@@ -657,6 +682,27 @@ def free_comfy_vram():
         return False
 
 
+def _canonical_model_id(model_id):
+    """Ollama treats a bare name as the implicit :latest tag."""
+    return model_id if ":" in model_id else f"{model_id}:latest"
+
+
+def chat_num_ctx(model_id):
+    """Context for a chat request, honoring per-model overrides.
+
+    The lookup canonicalizes both the requested id and every override key
+    to Ollama's full name form, so "mini" and "mini:latest" resolve to the
+    same override while a different tag ("mini:1") stays a different model.
+    """
+    canonical = _canonical_model_id(model_id)
+    if canonical in CHAT_NUM_CTX_OVERRIDES:
+        return CHAT_NUM_CTX_OVERRIDES[canonical]
+    for key, ctx in CHAT_NUM_CTX_OVERRIDES.items():
+        if _canonical_model_id(key) == canonical:
+            return ctx
+    return CHAT_NUM_CTX
+
+
 def chat_model_ready(model_id):
     """True when the model sits in VRAM right now (Ollama /api/ps)."""
     try:
@@ -665,7 +711,7 @@ def chat_model_ready(model_id):
         for m in models:
             if model_id in (m.get("name"), m.get("model")):
                 total = m.get("size") or 1
-                return (m.get("context_length") == CHAT_NUM_CTX
+                return (m.get("context_length") == chat_num_ctx(model_id)
                         and (m.get("size_vram") or 0) >= 0.5 * total)
     except Exception:
         pass
@@ -677,7 +723,7 @@ def warm_chat_model(model_id):
     payload = {"model": model_id, "keep_alive": CHAT_KEEP_ALIVE,
                # must match the chat runner options or Ollama treats it as a
                # different instance and reloads on every message
-               "options": {"num_ctx": CHAT_NUM_CTX}}
+               "options": {"num_ctx": chat_num_ctx(model_id)}}
     req = urllib.request.Request(
         OLLAMA + "/api/generate", data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"})
@@ -1065,7 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
                    "keep_alive": CHAT_KEEP_ALIVE,
                    # context knobs only apply inside options{} — top-level
                    # fields are silently ignored and 4k ctx cuts long code
-                   "options": {"num_ctx": CHAT_NUM_CTX, "num_predict": -1}}
+                   "options": {"num_ctx": chat_num_ctx(model_id), "num_predict": -1}}
         req = urllib.request.Request(
             OLLAMA + "/api/chat", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"})
@@ -1126,7 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
                     if delta:
                         emit({"delta": delta})
                     if chunk.get("done"):
-                        usage = {"ctx": CHAT_NUM_CTX}
+                        usage = {"ctx": chat_num_ctx(model_id)}
                         if isinstance(chunk.get("prompt_eval_count"), int):
                             usage["prompt"] = chunk["prompt_eval_count"]
                         if isinstance(chunk.get("eval_count"), int):

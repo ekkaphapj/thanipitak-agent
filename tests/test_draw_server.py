@@ -492,6 +492,66 @@ class WarmModelTest(unittest.TestCase):
                 draw_server.warm_chat_model("qwen3:8b")
 
 
+class ChatNumCtxOverrideTest(unittest.TestCase):
+    def test_parse_valid_and_empty(self):
+        self.assertEqual(draw_server._parse_ctx_overrides(""), {})
+        self.assertEqual(draw_server._parse_ctx_overrides("   "), {})
+        self.assertEqual(draw_server._parse_ctx_overrides('{"m:1": 4096}'),
+                         {"m:1": 4096})
+
+    def test_parse_rejects_malformed(self):
+        for raw in ('{not json', '[1, 2]', '{"m": 0}', '{"m": -4096}',
+                    '{"m": 1.5}', '{"m": "big"}', '{"": 4096}'):
+            with self.assertRaises(SystemExit, msg=raw):
+                draw_server._parse_ctx_overrides(raw)
+
+    def test_lookup_matches_canonical_forms(self):
+        overrides = {"mini:1": 4096, "bare": 8192, "late:latest": 2048}
+        with mock.patch.object(draw_server, "CHAT_NUM_CTX_OVERRIDES", overrides):
+            self.assertEqual(draw_server.chat_num_ctx("mini:1"), 4096)
+            # a different tag is a different model, so it keeps the default
+            self.assertEqual(draw_server.chat_num_ctx("mini"),
+                             draw_server.CHAT_NUM_CTX)
+            self.assertEqual(draw_server.chat_num_ctx("bare"), 8192)
+            self.assertEqual(draw_server.chat_num_ctx("bare:latest"), 8192)
+            self.assertEqual(draw_server.chat_num_ctx("late:latest"), 2048)
+            self.assertEqual(draw_server.chat_num_ctx("other:9"),
+                             draw_server.CHAT_NUM_CTX)
+
+    def test_warmup_uses_override(self):
+        stream = OllamaStream([{"done": True}])
+        with mock.patch.object(draw_server, "CHAT_NUM_CTX_OVERRIDES",
+                               {"typhoon2.5-4b": 4096}), \
+             mock.patch.object(urllib.request, "urlopen",
+                               return_value=stream) as urlopen:
+            draw_server.warm_chat_model("typhoon2.5-4b:latest")
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["options"]["num_ctx"], 4096)
+
+    def test_ready_check_uses_override(self):
+        class PsResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"models": [
+                    {"name": "hot:latest", "size": 10, "size_vram": 8,
+                     "context_length": 4096},
+                    {"name": "wrongctx:latest", "size": 10, "size_vram": 8,
+                     "context_length": 8192},
+                ]}).encode()
+
+        with mock.patch.object(draw_server, "CHAT_NUM_CTX_OVERRIDES",
+                               {"hot": 4096}), \
+             mock.patch.object(urllib.request, "urlopen",
+                               return_value=PsResponse()):
+            self.assertTrue(draw_server.chat_model_ready("hot:latest"))
+            self.assertFalse(draw_server.chat_model_ready("wrongctx:latest"))
+
+
 def login(base):
     """Exchange the shared password for a bearer token against a live server."""
     request = urllib.request.Request(
@@ -583,6 +643,26 @@ class ChatHttpTest(unittest.TestCase):
         self.assertEqual(usage, {"ctx": draw_server.CHAT_NUM_CTX,
                                  "prompt": 120, "eval": 8})
         self.assertTrue(rows[-1]["done"])
+
+    def test_per_model_ctx_override_applies_to_stream_and_usage(self):
+        lines = [
+            {"message": {"content": "ok"}, "done": False},
+            {"message": {"content": ""}, "done": True,
+             "prompt_eval_count": 10, "eval_count": 2},
+        ]
+        body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+        with mock.patch.object(draw_server, "CHAT_NUM_CTX_OVERRIDES",
+                               {"qwen3:8b": 4096}), \
+             self.ollama_mock(lines) as urlopen, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True), \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"):
+            with self.chat_post(body) as response:
+                streamed = response.read().decode()
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["options"]["num_ctx"], 4096)
+        rows = [json.loads(l) for l in streamed.splitlines() if l.strip()]
+        self.assertEqual(rows[-2]["usage"]["ctx"], 4096)
 
     def test_heartbeat_keeps_connection_alive_while_ollama_is_silent(self):
         class SlowStream:
