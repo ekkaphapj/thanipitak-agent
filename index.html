@@ -43,6 +43,8 @@ textarea{min-height:145px;resize:vertical}textarea::placeholder{color:#888486}
 .chip-label{flex:0 0 auto;width:76px;font-size:12px;color:#b7a9ab;padding-top:9px}
 .seed-row{display:flex;gap:8px;margin-top:6px;align-items:stretch}
 .seed-row input{flex:1;min-width:0}
+.field-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.chip-mini{padding:3px 10px;font-size:11px}
 .ref-row{display:flex;gap:14px;align-items:center}.ref-row img{display:none;width:92px;height:92px;object-fit:cover;border-radius:12px;border:1px solid #575052}
 .upload-btn{display:inline-flex;align-items:center;gap:8px;padding:11px 14px;border:1px solid #575052;border-radius:11px;background:#19191b;color:#e8dfe0;font-size:13px;cursor:pointer}
 .upload-btn:hover{border-color:#bb5a55;background:#2b2729}.upload-btn input{display:none}
@@ -265,7 +267,10 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
   <form id="music-form">
     <div class="music-grid">
       <div class="music-side">
-        <label for="music-style">สไตล์เพลง <span class="required" aria-hidden="true">*</span></label>
+        <div class="field-head">
+          <label for="music-style">สไตล์เพลง <span class="required" aria-hidden="true">*</span></label>
+          <button class="chip chip-mini" type="button" id="music-style-clear" title="ล้างสไตล์และยกเลิกปุ่มที่เลือก">ล้าง</button>
+        </div>
         <textarea id="music-style" required maxlength="800" style="min-height:110px" placeholder="เช่น English, warm female vocal, acoustic pop, 92 BPM, acoustic guitar, soft piano"></textarea>
         <p class="hint">เลือกแนวเพลง เสียงร้อง และจังหวะจากปุ่ม — ระบบจะประกอบเป็นสไตล์ให้อัตโนมัติ แก้ข้อความเองเพิ่มได้</p>
         <div class="chip-row" role="group" aria-label="แนวเพลง"><span class="chip-label">แนวเพลง</span><div class="chips">
@@ -286,7 +291,10 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
         </div></div>
       </div>
       <div class="music-side">
-        <label for="music-lyrics">เนื้อร้อง (ไม่บังคับ — เว้นว่างเพื่อขอเพลงเครื่องดนตรี)</label>
+        <div class="field-head">
+          <label for="music-lyrics">เนื้อร้อง (ไม่บังคับ — เว้นว่างเพื่อขอเพลงเครื่องดนตรี)</label>
+          <button class="chip chip-mini" type="button" id="music-lyrics-clear" title="ล้างเนื้อร้อง">ล้าง</button>
+        </div>
         <textarea id="music-lyrics" maxlength="8000" style="min-height:110px" placeholder="[Verse]&#10;เขียนเนื้อร้องบรรทัดต่อบรรทัด&#10;&#10;[Chorus]&#10;ท่อนฮุคที่อยากให้จำ"></textarea>
         <p class="hint">แบ่งท่อนด้วยแท็ก [Verse] [Chorus] [Bridge] [Outro] — ใส่เฉพาะถ้อยคำที่ให้ร้อง</p>
         <label for="music-seconds" style="margin-top:16px">ความยาวสูงสุด</label>
@@ -617,6 +625,8 @@ document.querySelectorAll("#music-page [data-genre],#music-page [data-vocal],#mu
   musicPick[kind]=musicPick[kind]===button.dataset[kind]?null:button.dataset[kind];
   renderMusicPick();$("music-style").focus();
 }));
+$("music-style-clear").addEventListener("click",()=>{musicPick.genre=null;musicPick.vocal=null;musicPick.tempo=null;renderMusicPick();$("music-style").focus()});
+$("music-lyrics-clear").addEventListener("click",()=>{$("music-lyrics").value="";$("music-lyrics").focus()});
 let lastMusicSeed=null;
 $("music-seed-last").addEventListener("click",()=>{$("music-seed").value=lastMusicSeed;$("music-seed").focus()});
 $("music-clear").addEventListener("click",async()=>{
