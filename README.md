@@ -133,9 +133,13 @@ python -m unittest discover -s tests -v
 
 ```bash
 sudo cp deploy/systemd/qwen-draw@.service /etc/systemd/system/
+sudo mkdir -p /etc/systemd/system/qwen-draw@ekkaphap.service.d
+sudo cp deploy/systemd/qwen-draw@.service.d/override.conf /etc/systemd/system/qwen-draw@ekkaphap.service.d/
 sudo systemctl daemon-reload
 sudo systemctl enable --now qwen-draw@ekkaphap
 ```
+
+ไฟล์ `deploy/systemd/qwen-draw@.service.d/override.conf` คือ drop-in ตั้งค่า `CHAT_NUM_CTX_OVERRIDES` ต่อโมเดล (โมเดล 14B ที่ ctx ปริยาย 32768 จะล้น KV cache ลง RAM และช้าลง ~3 เท่า) ปรับรายชื่อโมเดล/ค่าได้ตามที่ติดตั้งจริง ต้องคง single-quote ครอบค่า JSON ไว้ให้ครบ — ถ้า quote หลุด systemd จะกลืนอักษร `"` ทำให้ service ไม่ขึ้นเพราะ draw_server ตรวจสอบ JSON ตอนเริ่มทำงาน
 
 ## ไฟล์ที่ไม่ควร commit
 

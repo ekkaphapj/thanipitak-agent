@@ -12,8 +12,11 @@ Environment=COMFY_HOME=/home/%i/ComfyUI
 Environment=COMFY_URL=http://127.0.0.1:8188
 Environment=DRAW_HOST=127.0.0.1
 Environment=DRAW_PORT=8190
+# FLUX.2 [klein] uncensored text encoder installed in ComfyUI models/text_encoders
+Environment=FLUX_TEXT_ENCODER=flux2-klein-4b-uncensored-q8_0.gguf
 Environment=ENRICHER_URL=http://127.0.0.1:11434/v1/chat/completions
-Environment=ENRICHER_MODEL=hf.co/typhoon-ai/typhoon2.5-qwen3-4b-gguf:Q4_K_M
+Environment=ENRICHER_MODEL=typhoon2.5-4b
+Environment=ENRICHER_TIMEOUT=180
 ExecStart=/usr/bin/python3 /home/%i/thanipitak-agent/draw_server.py
 Restart=on-failure
 RestartSec=3
