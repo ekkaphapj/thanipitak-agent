@@ -561,9 +561,17 @@ def login(base):
         return json.load(response)["token"]
 
 
-class ChatHttpTest(unittest.TestCase):
+class ChatServerTest(unittest.TestCase):
+    """Boots the real Handler with a stubbed Ollama catalog; shared by chat,
+    lyrics and queue endpoint tests."""
+
     def setUp(self):
         draw_server.JOBS.clear()
+        # Fresh gates so a test that times out mid-queue cannot leak state
+        draw_server.COMFY_GATE = draw_server.QueueGate(
+            "comfy", draw_server.QUEUE_MAX_COMFY)
+        draw_server.CHAT_GATE = draw_server.QueueGate(
+            "chat", draw_server.QUEUE_MAX_CHAT)
         self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -584,14 +592,6 @@ class ChatHttpTest(unittest.TestCase):
         draw_server.JOBS.clear()
         draw_server.SESSIONS.clear()
 
-    def test_models_endpoint_filters_embeddings_and_flags_vision(self):
-        request = urllib.request.Request(self.base + "/api/chat/models",
-                                         headers=self.auth)
-        with urllib.request.urlopen(request) as response:
-            data = json.load(response)
-        self.assertEqual([m["id"] for m in data["models"]], ["qwen3:8b", "vl:4b"])
-        self.assertEqual([m["vision"] for m in data["models"]], [False, True])
-
     def ollama_mock(self, chunks):
         """Patch urlopen only for Ollama URLs so the test's own calls pass through."""
         real_urlopen = urllib.request.urlopen
@@ -608,6 +608,16 @@ class ChatHttpTest(unittest.TestCase):
             self.base + "/api/chat", json.dumps(body).encode(),
             {"Content-Type": "application/json", **self.auth}, method="POST")
         return urllib.request.urlopen(request, timeout=5)
+
+
+class ChatHttpTest(ChatServerTest):
+    def test_models_endpoint_filters_embeddings_and_flags_vision(self):
+        request = urllib.request.Request(self.base + "/api/chat/models",
+                                         headers=self.auth)
+        with urllib.request.urlopen(request) as response:
+            data = json.load(response)
+        self.assertEqual([m["id"] for m in data["models"]], ["qwen3:8b", "vl:4b"])
+        self.assertEqual([m["vision"] for m in data["models"]], [False, True])
 
     def test_chat_streams_deltas_and_user_content(self):
         lines = [
@@ -732,6 +742,30 @@ class ChatHttpTest(unittest.TestCase):
         warm.assert_not_called()
         self.assertNotIn("stage", [k for r in rows for k in r])
         self.assertTrue(rows[-1]["done"])
+
+    def test_chat_emits_queue_stage_while_gate_is_busy(self):
+        holder = draw_server.CHAT_GATE.reserve()
+        self.assertTrue(draw_server.CHAT_GATE.try_promote(holder, 0.1))
+        # Release the lane mid-request; the test thread blocks on the stream,
+        # so a timer must free the slot or the stream would wait forever.
+        releaser = threading.Timer(0.25, lambda: draw_server.CHAT_GATE.leave(holder))
+        releaser.start()
+        try:
+            body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
+            lines = [{"message": {"content": "ok"}, "done": True}]
+            with mock.patch.object(draw_server, "QUEUE_EVENT_INTERVAL", 0.02), \
+                 self.ollama_mock(lines), \
+                 mock.patch.object(draw_server, "chat_model_ready", return_value=True), \
+                 mock.patch.object(draw_server, "free_comfy_vram"), \
+                 mock.patch.object(draw_server, "warm_chat_model"):
+                with self.chat_post(body) as response:
+                    rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+            queued = [r for r in rows if r.get("stage") == "queue"]
+            self.assertTrue(queued)
+            self.assertGreaterEqual(queued[0]["position"], 1)
+            self.assertTrue(rows[-1]["done"])
+        finally:
+            releaser.join(timeout=2)
 
     def test_length_cut_reports_truncation(self):
         body = {"model": "qwen3:8b", "messages": [{"role": "user", "content": "hi"}]}
@@ -923,6 +957,207 @@ class ChatHttpTest(unittest.TestCase):
         self.assertEqual(error.exception.code, 400)
         self.assertIn("broken.xlsx", json.loads(error.exception.read().decode())["error"])
         error.exception.close()
+
+
+class QueueGateTest(unittest.TestCase):
+    def test_fifo_order_and_positions(self):
+        gate = draw_server.QueueGate("test", 1)
+        first = gate.reserve()
+        self.assertTrue(gate.try_promote(first, 0.1))
+        second = gate.reserve()
+        third = gate.reserve()
+        self.assertEqual(gate.position(second), 1)
+        self.assertEqual(gate.position(third), 2)
+        self.assertEqual(gate.snapshot(), {"active": 1, "waiting": 2, "max": 1})
+        self.assertFalse(gate.try_promote(third, 0.05))  # second is the head
+        gate.leave(first)
+        self.assertTrue(gate.try_promote(second, 1.0))
+        self.assertEqual(gate.position(third), 1)
+        gate.leave(second)
+        gate.cancel(third)
+        self.assertEqual(gate.snapshot(), {"active": 0, "waiting": 0, "max": 1})
+
+    def test_grant_is_immediate_when_idle(self):
+        gate = draw_server.QueueGate("test", 1)
+        ticket = gate.reserve()
+        self.assertTrue(gate.try_promote(ticket, 0.1))
+        self.assertEqual(gate.position(ticket), 0)
+        gate.leave(ticket)
+
+    def test_blocked_waiter_is_promoted_from_another_thread(self):
+        gate = draw_server.QueueGate("test", 1)
+        holder = gate.reserve()
+        self.assertTrue(gate.try_promote(holder, 0.1))
+        events = []
+
+        def worker():
+            ticket = gate.reserve()
+            events.append(("reserved", ticket))
+            if gate.try_promote(ticket, 5.0):
+                events.append(("granted", ticket))
+                gate.leave(ticket)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        deadline = time.time() + 2
+        while len(events) < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(gate.position(events[0][1]), 1)
+        gate.leave(holder)
+        thread.join(timeout=3)
+        self.assertEqual([kind for kind, _ in events], ["reserved", "granted"])
+        self.assertEqual(gate.snapshot()["active"], 0)
+
+    def test_cancel_removes_waiter(self):
+        gate = draw_server.QueueGate("test", 1)
+        holder = gate.reserve()
+        self.assertTrue(gate.try_promote(holder, 0.1))
+        waiter = gate.reserve()
+        self.assertEqual(gate.position(waiter), 1)
+        gate.cancel(waiter)
+        self.assertEqual(gate.position(waiter), 0)
+        self.assertEqual(gate.snapshot()["waiting"], 0)
+        gate.leave(holder)
+
+
+class QueueHttpTest(ChatServerTest):
+    def setUp(self):
+        super().setUp()
+        self.available = mock.patch.object(draw_server, "available_models", return_value={
+            draw_server.DEFAULT_MODEL_ID: True, draw_server.FLUX_MODEL_ID: True})
+        self.available.start()
+
+    def tearDown(self):
+        self.available.stop()
+        super().tearDown()
+
+    def get(self, path):
+        request = urllib.request.Request(self.base + path, headers=self.auth)
+        return urllib.request.urlopen(request, timeout=5)
+
+    def test_queue_endpoint_reports_both_lanes(self):
+        with self.get("/api/queue") as response:
+            data = json.load(response)
+        self.assertEqual(set(data), {"comfy", "chat"})
+        self.assertEqual(data["comfy"], {"active": 0, "waiting": 0,
+                                         "max": draw_server.QUEUE_MAX_COMFY})
+        self.assertEqual(data["chat"], {"active": 0, "waiting": 0,
+                                        "max": draw_server.QUEUE_MAX_CHAT})
+
+    def test_queue_endpoint_requires_auth(self):
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(self.base + "/api/queue")
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+
+    def test_job_waits_for_gate_and_reports_position(self):
+        history = {"p1": {"status": {"status_str": "success", "completed": True},
+                          "outputs": {"7": {"images": [
+                              {"filename": "out.png", "type": "output"}]}}}}
+        holder = draw_server.COMFY_GATE.reserve()
+        self.assertTrue(draw_server.COMFY_GATE.try_promote(holder, 0.1))
+        held = True
+        try:
+            with mock.patch.object(draw_server, "enhance_prompt", return_value="bird"), \
+                 mock.patch.object(draw_server, "release_ollama_vram"), \
+                 mock.patch.object(draw_server, "comfy_post", return_value={"prompt_id": "p1"}), \
+                 mock.patch.object(draw_server, "comfy_get", return_value=history), \
+                 mock.patch.object(draw_server.time, "sleep"):
+                request = urllib.request.Request(
+                    self.base + "/api/generate", json.dumps({"prompt": "bird"}).encode(),
+                    {"Content-Type": "application/json", **self.auth}, method="POST")
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    job = json.load(response)
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    with self.get(f"/api/status/{job['id']}") as response:
+                        data = json.load(response)
+                    if data.get("queue_position", 0) >= 1:
+                        break
+                    time.sleep(0.05)
+                self.assertGreaterEqual(data.get("queue_position", 0), 1)
+                self.assertEqual(data["status"], "queued")
+                draw_server.COMFY_GATE.leave(holder)
+                held = False
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    with self.get(f"/api/status/{job['id']}") as response:
+                        data = json.load(response)
+                    if data["status"] == "done":
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(data["status"], "done")
+                self.assertEqual(data.get("queue_position", 0), 0)
+        finally:
+            if held:
+                draw_server.COMFY_GATE.cancel(holder)
+
+
+class LyricsHttpTest(ChatServerTest):
+    def post_lyrics(self, body):
+        request = urllib.request.Request(
+            self.base + "/api/lyrics", json.dumps(body).encode(),
+            {"Content-Type": "application/json", **self.auth}, method="POST")
+        return urllib.request.urlopen(request, timeout=5)
+
+    def test_lyrics_streams_into_tagged_sections(self):
+        body = {"model": "qwen3:8b", "genre": "เพลงมาร์ชโรงเรียน", "topic": "ครูใจดี"}
+        lines = [
+            {"message": {"content": "[Verse 1]\nเดินก้าวไปข้างหน้า"}, "done": False},
+            {"message": {"content": "\n[Chorus]\nร้องด้วยกัน"}, "done": False},
+            {"message": {"content": ""}, "done": True},
+        ]
+        with self.ollama_mock(lines) as urlopen, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True):
+            with self.post_lyrics(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["model"], "qwen3:8b")
+        self.assertEqual(sent["messages"][0]["role"], "system")
+        self.assertIn("[Verse 1]", sent["messages"][0]["content"])
+        self.assertIn("[Chorus]", sent["messages"][0]["content"])
+        self.assertIn("เพลงมาร์ชโรงเรียน", sent["messages"][-1]["content"])
+        self.assertIn("ครูใจดี", sent["messages"][-1]["content"])
+        self.assertEqual("".join(r.get("delta", "") for r in rows),
+                         "[Verse 1]\nเดินก้าวไปข้างหน้า\n[Chorus]\nร้องด้วยกัน")
+        self.assertTrue(rows[-1]["done"])
+
+    def test_lyrics_requires_genre_and_known_model(self):
+        for body in ({"genre": "pop"},                      # no model
+                     {"model": "qwen3:8b"},                 # no genre
+                     {"model": "qwen3:8b", "genre": " "},   # blank genre
+                     {"model": "qwen3:8b", "genre": "x" * 401},
+                     {"model": "ghost", "genre": "pop"},
+                     {"model": "qwen3:8b", "genre": "pop", "topic": "y" * 401}):
+            with self.subTest(body=body), \
+                    self.assertRaises(urllib.error.HTTPError) as error:
+                self.post_lyrics(body)
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+
+    def test_lyrics_resolves_untagged_model(self):
+        body = {"model": "typhoon2-8b", "genre": "pop"}
+        lines = [{"message": {"content": "[Verse 1]\na"}, "done": True}]
+        with mock.patch.object(draw_server, "ollama_tags", return_value=[
+                {"model": "typhoon2-8b:latest", "capabilities": ["completion"]}]), \
+             self.ollama_mock(lines) as urlopen, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True):
+            with self.post_lyrics(body) as response:
+                response.read()
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["model"], "typhoon2-8b:latest")
+
+    def test_lyrics_upstream_error_is_forwarded(self):
+        body = {"model": "qwen3:8b", "genre": "pop"}
+        chunks = [{"message": {"content": "บางส่วน"}, "done": False},
+                  {"error": "runner failed"}]
+        with self.ollama_mock(chunks), \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True):
+            with self.post_lyrics(body) as response:
+                rows = [json.loads(l) for l in response.read().decode().splitlines() if l.strip()]
+        self.assertEqual(rows[-1]["error"], "runner failed")
+        self.assertFalse(any(r.get("done") for r in rows))
 
 
 class PdfPreprocessTest(unittest.TestCase):

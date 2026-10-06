@@ -102,6 +102,16 @@ JOB_TIMEOUT = 900  # seconds
 YUE2_CHECKPOINT = os.environ.get("YUE2_CHECKPOINT", "yue2_3b_int8_convrot.safetensors")
 MUSIC_JOB_TIMEOUT = 3600  # seconds
 MUSIC_MAX_SECONDS = 240
+# One GPU, many users: each lane caps how many jobs run at once and the rest
+# wait in a FIFO with live queue positions. Chat (Ollama) and ComfyUI jobs
+# queue separately so simultaneous users never thrash the 12GB card.
+QUEUE_MAX_COMFY = max(1, int(os.environ.get("QUEUE_MAX_COMFY", "1")))
+QUEUE_MAX_CHAT = max(1, int(os.environ.get("QUEUE_MAX_CHAT", "1")))
+QUEUE_WAIT_TIMEOUT = float(os.environ.get("QUEUE_WAIT_TIMEOUT", "900"))
+QUEUE_EVENT_INTERVAL = float(os.environ.get("QUEUE_EVENT_INTERVAL", "3"))
+# Image/music jobs unload the chat model before sampling; give an in-flight
+# answer this many seconds to finish first so it is not cut off mid-stream.
+CHAT_GRACE_SECONDS = float(os.environ.get("CHAT_GRACE_SECONDS", "90"))
 MAX_BODY = 12 * 1024 * 1024  # allows a base64 reference image
 MAX_REFERENCE = 10 * 1024 * 1024
 # Qwen-Image-2.1 is distilled. The ComfyUI template samples euler/simple at
@@ -141,6 +151,78 @@ PROMPT_CACHE = {}
 PROMPT_CACHE_MAX = 256
 CHAT_CAPABILITY_CACHE = {}
 
+
+class QueueGate:
+    """FIFO ticket gate that caps concurrent jobs and reports queue positions."""
+
+    def __init__(self, name, max_active):
+        self.name = name
+        self.max_active = max_active
+        self.cond = threading.Condition()
+        self.active = 0
+        self.waiting = []  # ticket numbers in arrival order
+        self._next_ticket = 0
+
+    def reserve(self):
+        """Join the queue; pair with try_promote() then leave()/cancel()."""
+        with self.cond:
+            ticket = self._next_ticket
+            self._next_ticket += 1
+            self.waiting.append(ticket)
+            return ticket
+
+    def try_promote(self, ticket, timeout):
+        """Grant the slot to the queue head within `timeout` seconds."""
+        with self.cond:
+            deadline = time.time() + max(0.0, timeout)
+            while True:
+                if self.waiting and self.waiting[0] == ticket \
+                        and self.active < self.max_active:
+                    self.waiting.pop(0)
+                    self.active += 1
+                    return True
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self.cond.wait(min(remaining, 0.5))
+
+    def leave(self, ticket):
+        with self.cond:
+            self.active = max(0, self.active - 1)
+            self.cond.notify_all()
+
+    def cancel(self, ticket):
+        with self.cond:
+            if ticket in self.waiting:
+                self.waiting.remove(ticket)
+            self.cond.notify_all()
+
+    def position(self, ticket):
+        """How many jobs run before this one; 0 once the slot is granted."""
+        with self.cond:
+            if ticket in self.waiting:
+                return self.active + self.waiting.index(ticket)
+            return 0
+
+    def snapshot(self):
+        with self.cond:
+            return {"active": self.active, "waiting": len(self.waiting),
+                    "max": self.max_active}
+
+
+COMFY_GATE = QueueGate("comfy", QUEUE_MAX_COMFY)
+CHAT_GATE = QueueGate("chat", QUEUE_MAX_CHAT)
+
+
+def wait_chat_idle(timeout):
+    """Wait for in-flight chats so their model is not yanked mid-answer."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if CHAT_GATE.snapshot()["active"] == 0:
+            return True
+        time.sleep(1.0)
+    return CHAT_GATE.snapshot()["active"] == 0
+
 ENHANCER_SYSTEM = (
     "You translate Thai image-generation prompts into English prompts for a "
     "text-to-image model. Keep the same subjects, counts, colors, positions and "
@@ -162,6 +244,16 @@ ENHANCER_SYSTEM = (
     "-> Three red shirts on a wooden table."
 )
 QUOTED_RE = re.compile(r'"([^"\n]+)"')
+# The lyrics tab asks a local chat model for YuE2-ready lyrics: tagged
+# sections only, no preamble, so the text can drop straight into the song form.
+LYRICS_SYSTEM = (
+    "คุณเป็นนักแต่งเนื้อร้องมืออาชีพ ช่วยเขียนเนื้อร้องภาษาไทยสำหรับโมเดลสร้างเพลง YuE2 "
+    "ตอบเฉพาะเนื้อร้องเท่านั้น ห้ามอธิบายเพิ่ม ห้ามใช้ markdown ห้ามเขียนชื่อเพลงหรือคำนำหน้า "
+    "จัดทุกท่อนด้วยแท็กวงเล็บเหลี่ยมบนบรรทัดของตัวเองในรูปแบบ: [Verse 1], [Chorus], [Verse 2], [Bridge], [Outro] "
+    "ต้องเริ่มด้วย [Verse 1] และมีท่อน [Chorus] อย่างน้อยหนึ่งท่อน "
+    "แต่ละท่อนมี 4-8 บรรทัด รวมความยาวพอเหมาะกับเพลง 1-2 นาที "
+    "เขียนให้ร้องได้จริง มีคำสัมผัส จำง่าย และเข้ากับแนวเพลงที่ผู้ใช้กำหนด"
+)
 
 
 def compose_prompt(prompt, negative):
@@ -940,7 +1032,23 @@ def build_yue2_graph(style, lyrics, seconds, seed, planning=True):
 
 
 def run_music_job(job_id, spec):
+    ticket = COMFY_GATE.reserve()
+    granted = False
+    queue_deadline = time.time() + QUEUE_WAIT_TIMEOUT
     try:
+        while not COMFY_GATE.try_promote(ticket, QUEUE_EVENT_INTERVAL):
+            with LOCK:
+                JOBS[job_id]["queue_position"] = COMFY_GATE.position(ticket)
+            if time.time() >= queue_deadline:
+                raise RuntimeError("รอคิวนานเกินไป (มากกว่า "
+                                   f"{int(QUEUE_WAIT_TIMEOUT)} วินาที) กรุณาลองใหม่ภายหลัง")
+        granted = True
+        with LOCK:
+            JOBS[job_id]["queue_position"] = 0
+        if CHAT_GATE.snapshot()["active"]:
+            with LOCK:
+                JOBS[job_id]["stage"] = "waiting_chat"
+            wait_chat_idle(CHAT_GRACE_SECONDS)
         with LOCK:
             JOBS[job_id]["stage"] = "freeing"
         release_ollama_vram()  # YuE2 shares the 12GB card with the chat model
@@ -984,65 +1092,90 @@ def run_music_job(job_id, spec):
         with LOCK:
             JOBS[job_id]["status"] = "error"
             JOBS[job_id]["error"] = str(e)[:500]
+    finally:
+        if granted:
+            COMFY_GATE.leave(ticket)
+        else:
+            COMFY_GATE.cancel(ticket)
 
 
 def run_job(job_id, spec, ref_path=None):
+    ticket = COMFY_GATE.reserve()
+    granted = False
+    queue_deadline = time.time() + QUEUE_WAIT_TIMEOUT
     try:
-        try:
-            source = spec["prompt"]
-            if spec.get("model_id", DEFAULT_MODEL_ID) == DEFAULT_MODEL_ID:
-                source = compose_prompt(source, spec.get("negative") or "")
+        while not COMFY_GATE.try_promote(ticket, QUEUE_EVENT_INTERVAL):
             with LOCK:
-                JOBS[job_id]["stage"] = "translating"
-            final_prompt = enhance_prompt(source)
+                JOBS[job_id]["queue_position"] = COMFY_GATE.position(ticket)
+            if time.time() >= queue_deadline:
+                raise RuntimeError("รอคิวนานเกินไป (มากกว่า "
+                                   f"{int(QUEUE_WAIT_TIMEOUT)} วินาที) กรุณาลองใหม่ภายหลัง")
+        granted = True
+        with LOCK:
+            JOBS[job_id]["queue_position"] = 0
+        source = spec["prompt"]
+        if spec.get("model_id", DEFAULT_MODEL_ID) == DEFAULT_MODEL_ID:
+            source = compose_prompt(source, spec.get("negative") or "")
+        with LOCK:
+            JOBS[job_id]["stage"] = "translating"
+        final_prompt = enhance_prompt(source)
+        with LOCK:
+            if final_prompt != spec["prompt"]:
+                JOBS[job_id]["prompt_enhanced"] = final_prompt
+        if CHAT_GATE.snapshot()["active"]:
             with LOCK:
-                if final_prompt != spec["prompt"]:
-                    JOBS[job_id]["prompt_enhanced"] = final_prompt
-                # Drop the chat model after translation. The enricher itself
-                # may be the model now sitting on the GPU.
-                JOBS[job_id]["stage"] = "freeing"
-            release_ollama_vram()
-            with LOCK:
-                JOBS[job_id]["stage"] = "sampling"
-            graph = build_graph(final_prompt, "", spec["resolution"],
-                                spec["seed"], spec["profile"], spec["reference"],
-                                spec["model_id"])
-            resp = comfy_post("/prompt", {"prompt": graph, "client_id": job_id})
-            pid = resp.get("prompt_id")
-            if not pid:
-                raise RuntimeError("comfy rejected prompt: " + json.dumps(resp)[:300])
-            with LOCK:
-                JOBS[job_id]["prompt_id"] = pid
-                JOBS[job_id]["status"] = "running"
-                JOBS[job_id]["started"] = time.time()
-            deadline = time.time() + JOB_TIMEOUT
-            while time.time() < deadline:
-                time.sleep(2)
-                history = comfy_get(f"/history/{pid}")
-                if history == {}:
-                    continue
-                item = next(iter(history.values()))
-                status = item.get("status", {})
-                if status.get("status_str") == "error":
-                    msgs = [m for m in status.get("messages", []) if m[0] == "execution_error"]
-                    detail = json.dumps(msgs[-1])[:400] if msgs else "comfy execution error"
-                    raise RuntimeError(detail)
-                if status.get("completed"):
-                    for output in item.get("outputs", {}).values():
-                        for img in output.get("images", []):
-                            if img.get("type") == "output":
-                                with LOCK:
-                                    JOBS[job_id]["file"] = img["filename"]
-                                    JOBS[job_id]["status"] = "done"
-                                    JOBS[job_id]["finished"] = time.time()
-                                return
-                    raise RuntimeError("finished but no output image found")
-            raise RuntimeError("timeout waiting for ComfyUI")
-        except Exception as e:  # surface the failure to the browser
-            with LOCK:
-                JOBS[job_id]["status"] = "error"
-                JOBS[job_id]["error"] = str(e)[:500]
+                JOBS[job_id]["stage"] = "waiting_chat"
+            wait_chat_idle(CHAT_GRACE_SECONDS)
+        with LOCK:
+            # Drop the chat model after translation. The enricher itself
+            # may be the model now sitting on the GPU.
+            JOBS[job_id]["stage"] = "freeing"
+        release_ollama_vram()
+        with LOCK:
+            JOBS[job_id]["stage"] = "sampling"
+        graph = build_graph(final_prompt, "", spec["resolution"],
+                            spec["seed"], spec["profile"], spec["reference"],
+                            spec["model_id"])
+        resp = comfy_post("/prompt", {"prompt": graph, "client_id": job_id})
+        pid = resp.get("prompt_id")
+        if not pid:
+            raise RuntimeError("comfy rejected prompt: " + json.dumps(resp)[:300])
+        with LOCK:
+            JOBS[job_id]["prompt_id"] = pid
+            JOBS[job_id]["status"] = "running"
+            JOBS[job_id]["started"] = time.time()
+        deadline = time.time() + JOB_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(2)
+            history = comfy_get(f"/history/{pid}")
+            if history == {}:
+                continue
+            item = next(iter(history.values()))
+            status = item.get("status", {})
+            if status.get("status_str") == "error":
+                msgs = [m for m in status.get("messages", []) if m[0] == "execution_error"]
+                detail = json.dumps(msgs[-1])[:400] if msgs else "comfy execution error"
+                raise RuntimeError(detail)
+            if status.get("completed"):
+                for output in item.get("outputs", {}).values():
+                    for img in output.get("images", []):
+                        if img.get("type") == "output":
+                            with LOCK:
+                                JOBS[job_id]["file"] = img["filename"]
+                                JOBS[job_id]["status"] = "done"
+                                JOBS[job_id]["finished"] = time.time()
+                            return
+                raise RuntimeError("finished but no output image found")
+        raise RuntimeError("timeout waiting for ComfyUI")
+    except Exception as e:  # surface the failure to the browser
+        with LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = str(e)[:500]
     finally:
+        if granted:
+            COMFY_GATE.leave(ticket)
+        else:
+            COMFY_GATE.cancel(ticket)
         if ref_path:  # uploaded references are single-use
             try:
                 (INPUT_DIR / ref_path).unlink()
@@ -1149,6 +1282,25 @@ class Handler(BaseHTTPRequestHandler):
                 emit({"notes": notes})
             # Keep browser document context identical to what Ollama sees.
             emit({"user_content": messages[-1]["content"]})
+            # Chat lane: one generation at a time; report the live position
+            # while waiting so the browser can show "you are Nth in queue".
+            ticket = None
+            granted = False
+            ticket = CHAT_GATE.reserve()
+            try:
+                queue_deadline = time.time() + QUEUE_WAIT_TIMEOUT
+                while not CHAT_GATE.try_promote(ticket, QUEUE_EVENT_INTERVAL):
+                    if stopped.is_set():
+                        return
+                    if time.time() >= queue_deadline:
+                        emit({"error": "คิวแชตยาวเกินไป (รอเกิน "
+                                       f"{int(QUEUE_WAIT_TIMEOUT)} วินาที) กรุณาลองใหม่ภายหลัง"})
+                        return
+                    emit({"stage": "queue", "position": CHAT_GATE.position(ticket)})
+                granted = True
+            except Exception:
+                CHAT_GATE.cancel(ticket)
+                raise
             if not chat_model_ready(model_id):
                 emit({"stage": "freeing"})
                 free_comfy_vram()
@@ -1192,6 +1344,10 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
         finally:
+            if granted:
+                CHAT_GATE.leave(ticket)
+            elif ticket is not None:
+                CHAT_GATE.cancel(ticket)
             stopped.set()
             heartbeat_thread.join(timeout=1)
 
@@ -1218,6 +1374,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, chat_models())
             except Exception:
                 self._send(503, {"error": "ollama ไม่พร้อมใช้งาน"})
+        elif route == "/api/queue":
+            self._send(200, {"comfy": COMFY_GATE.snapshot(),
+                             "chat": CHAT_GATE.snapshot()})
         elif route.startswith("/api/status/"):
             jid = route.rsplit("/", 1)[-1]
             with LOCK:
@@ -1271,6 +1430,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/chat":
             self._handle_chat()
+            return
+        if route == "/api/lyrics":
+            self._handle_lyrics()
             return
         if route == "/api/music/generate":
             self._handle_music()
@@ -1467,6 +1629,54 @@ class Handler(BaseHTTPRequestHandler):
             return
         notes = pdf_notes + (notes or [])
         self._stream_chat(model_id, messages, notes)
+
+    def _handle_lyrics(self):
+        """Write YuE2-ready lyrics with a local chat model; streams like /api/chat.
+
+        The browser plays the deltas into the lyrics textarea as they arrive,
+        so the finished text lands there with [Verse]/[Chorus] tags already.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > 65536:
+                raise ValueError("invalid body length")
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("invalid body")
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+            self._send(400, {"error": "invalid json"})
+            return
+        model_id = body.get("model")
+        if not isinstance(model_id, str) or not model_id:
+            self._send(400, {"error": "กรุณาเลือกโมเดล"})
+            return
+        try:
+            known = {m["id"]: m for m in chat_models()["models"]}
+        except Exception:
+            self._send(503, {"error": "ollama ไม่พร้อมใช้งาน"})
+            return
+        if model_id not in known and ":" not in model_id \
+                and f"{model_id}:latest" in known:
+            model_id = f"{model_id}:latest"
+        if model_id not in known:
+            self._send(400, {"error": "ไม่พบโมเดลนี้"})
+            return
+        genre = str(body.get("genre", "")).strip()
+        if not genre or len(genre) > 400:
+            self._send(400, {"error": "กรุณาพิมพ์แนวเพลง (ไม่เกิน 400 ตัวอักษร)"})
+            return
+        topic = str(body.get("topic", "")).strip()
+        if len(topic) > 400:
+            self._send(400, {"error": "หัวข้อยาวเกิน 400 ตัวอักษร"})
+            return
+        user_content = "แนวเพลง: " + genre
+        if topic:
+            user_content += "\nหัวข้อ/ธีมของเพลง: " + topic
+        user_content += "\nเขียนเนื้อร้องตามรูปแบบที่กำหนดไว้"
+        self._stream_chat(model_id, [
+            {"role": "system", "content": LYRICS_SYSTEM},
+            {"role": "user", "content": user_content},
+        ], [])
 
     def log_message(self, *args):
         pass
