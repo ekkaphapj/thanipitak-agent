@@ -137,7 +137,8 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
 /* ---- queue badge + lyrics generator ---- */
 .queue-badge{margin-left:auto;align-self:center;padding:9px 14px;border:1px solid #6b5330;border-radius:999px;background:#2b2416;color:#ffd39d;font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lyric-gen{display:grid;gap:9px;margin:0 0 18px;padding:14px;border:1px dashed #575052;border-radius:13px;background:#1b1b1e}
-.lyric-gen input,.lyric-gen select{padding:11px 13px;min-height:44px;font-size:15px}
+.lyric-gen input,.lyric-gen select,.lyric-gen textarea{padding:11px 13px;min-height:44px;font-size:15px;line-height:1.55}
+.lyric-gen textarea{resize:vertical}
 .lyric-go{display:flex;justify-content:center;align-items:center;gap:8px;min-height:46px;padding:10px 14px;border:1px solid #8a6a3b;border-radius:11px;background:linear-gradient(110deg,#6d4a12,#9a6d1d);color:#ffe9c2;font-weight:800;cursor:pointer}
 .lyric-go:hover:not(:disabled){filter:brightness(1.12)}
 .lyric-go.stopping{border-color:#89504d;background:transparent;color:#ffd8d4;filter:none}
@@ -303,8 +304,8 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
         <div class="lyric-gen" aria-label="สร้างเนื้อเพลงด้วย AI">
           <label for="music-lyrics-model">✍️ สร้างเนื้อเพลงด้วย AI — เลือกโมเดล พิมพ์แนวเพลง แล้วเนื้อร้องจะเติมในช่องด้านล่าง</label>
           <select id="music-lyrics-model" disabled><option value="">กำลังโหลดโมเดล…</option></select>
-          <input type="text" id="music-lyrics-genre" maxlength="400" placeholder="พิมพ์แนวเพลง เช่น เพลงมาร์ชโรงเรียน ปลุกใจ">
-          <input type="text" id="music-lyrics-topic" maxlength="400" placeholder="หัวข้อที่อยากให้เพลงเล่า (ไม่บังคับ)">
+          <textarea id="music-lyrics-genre" rows="2" maxlength="400" style="min-height:88px" placeholder="พิมพ์แนวเพลง เช่น เพลงมาร์ชโรงเรียน ปลุกใจ"></textarea>
+          <textarea id="music-lyrics-topic" rows="1" maxlength="400" style="min-height:64px" placeholder="หัวข้อที่อยากให้เพลงเล่า (ไม่บังคับ)"></textarea>
           <button class="lyric-go" id="music-lyrics-btn" type="button">✍️ สร้างเนื้อเพลง</button>
           <p class="hint" id="music-lyrics-status" role="status" aria-live="polite" hidden></p>
         </div>
@@ -713,6 +714,22 @@ function cleanLyrics(text){
   t=t.replace(/\[([^\]\n]{1,24})\]/g,"\n\n[$1]"); // tags on their own lines
   return t.replace(/[ \t]+\n/g,"\n").replace(/\n{3,}/g,"\n\n").trim();
 }
+// The lyrics model answers "[Style]\n<english style line>\n<lyrics…>"; split
+// the style off so it can fill the song-form style box automatically.
+function splitLyricsOutput(raw){
+  const text=String(raw||"").replace(/```[a-z]*\n?/gi,"").trim();
+  const head=text.match(/(?:^|\n)\s*(?:\[style\]\s*[:：]?|style\s*[:：])\s*\n?/i);
+  if(!head)return{style:"",lyrics:text};
+  const rest=text.slice(head.index+head[0].length);
+  const tag=rest.search(/^\s*\[/m);
+  if(tag<0)return{style:rest.trim(),lyrics:""};
+  return{style:rest.slice(0,tag).trim(),lyrics:rest.slice(tag).trim()};
+}
+function applyAiStyle(style){
+  musicPick.genre=null;musicPick.vocal=null;musicPick.tempo=null;
+  renderMusicPick(); // drop chip-composed style, then take the AI's
+  $("music-style").value=style;
+}
 $("music-lyrics-btn").addEventListener("click",async()=>{
   if(lyricBusy){lyricAbort&&lyricAbort.abort();return}
   const model=$("music-lyrics-model").value;
@@ -745,13 +762,25 @@ $("music-lyrics-btn").addEventListener("click",async()=>{
           const label=chunk.stage==="queue"?"รอคิว… มีงานก่อนหน้าอีก "+chunk.position+" งาน":chunk.stage==="freeing"?"กำลังคืนหน่วยความจำ GPU จาก ComfyUI…":"กำลังโหลดโมเดลเข้า GPU… อาจใช้เวลา 1-2 นาที กรุณารอสักครู่";
           setLyricStatus(label);
         }
-        if(chunk.delta){full+=chunk.delta;ta.value=cleanLyrics(full);ta.scrollTop=ta.scrollHeight}
+        if(chunk.delta){
+          full+=chunk.delta;
+          const parts=splitLyricsOutput(full);
+          if(parts.style)applyAiStyle(parts.style);
+          ta.value=cleanLyrics(parts.lyrics);ta.scrollTop=ta.scrollHeight;
+        }
         if(chunk.error)throw new Error(chunk.error);
-        if(chunk.done)setLyricStatus("สร้างเนื้อเพลงเสร็จแล้ว — ตรวจทานและแก้ไขได้ แล้วกด ♪ สร้างเพลง");
+        if(chunk.done){
+          const parts=splitLyricsOutput(full);
+          setLyricStatus(parts.style
+            ?"สร้างเนื้อเพลงเสร็จแล้ว — เติมสไตล์เพลงที่เหมาะสมในช่องสไตล์ให้แล้ว ตรวจทานก่อนกด ♪ สร้างเพลง"
+            :"สร้างเนื้อเพลงเสร็จแล้ว — ตรวจทานและแก้ไขได้ แล้วกด ♪ สร้างเพลง");
+        }
       }
     }
     if(!full.trim())throw new Error("โมเดลไม่ส่งเนื้อร้องกลับมา ลองเปลี่ยนโมเดลหรือลองอีกครั้ง");
-    ta.value=cleanLyrics(full);
+    const finalParts=splitLyricsOutput(full);
+    if(finalParts.style)applyAiStyle(finalParts.style);
+    ta.value=cleanLyrics(finalParts.lyrics);
   }catch(error){
     if(error.name==="AbortError")setLyricStatus("หยุดสร้างเนื้อเพลงแล้ว",true);
     else setLyricStatus("สร้างเนื้อเพลงไม่สำเร็จ: "+error.message,true);

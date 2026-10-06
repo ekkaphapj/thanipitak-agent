@@ -1115,6 +1115,7 @@ class LyricsHttpTest(ChatServerTest):
         sent = json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(sent["model"], "qwen3:8b")
         self.assertEqual(sent["messages"][0]["role"], "system")
+        self.assertIn("[Style]", sent["messages"][0]["content"])
         self.assertIn("[Verse 1]", sent["messages"][0]["content"])
         self.assertIn("[Chorus]", sent["messages"][0]["content"])
         self.assertIn("เพลงมาร์ชโรงเรียน", sent["messages"][-1]["content"])

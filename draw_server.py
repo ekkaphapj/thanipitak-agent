@@ -244,15 +244,21 @@ ENHANCER_SYSTEM = (
     "-> Three red shirts on a wooden table."
 )
 QUOTED_RE = re.compile(r'"([^"\n]+)"')
-# The lyrics tab asks a local chat model for YuE2-ready lyrics: tagged
-# sections only, no preamble, so the text can drop straight into the song form.
+# The lyrics tab asks a local chat model for YuE2-ready lyrics: a [Style]
+# line first (the browser pipes it into the song-form style box), then tagged
+# sections only, no preamble, so the text can drop straight into the form.
 LYRICS_SYSTEM = (
     "คุณเป็นนักแต่งเนื้อร้องมืออาชีพ ช่วยเขียนเนื้อร้องภาษาไทยสำหรับโมเดลสร้างเพลง YuE2 "
-    "ตอบเฉพาะเนื้อร้องเท่านั้น ห้ามอธิบายเพิ่ม ห้ามใช้ markdown ห้ามเขียนชื่อเพลงหรือคำนำหน้า "
-    "จัดทุกท่อนด้วยแท็กวงเล็บเหลี่ยมบนบรรทัดของตัวเองในรูปแบบ: [Verse 1], [Chorus], [Verse 2], [Bridge], [Outro] "
+    "ตอบเป็นสองส่วนตามลำดับนี้เท่านั้น ห้ามอธิบายอื่นใด ห้ามใช้ markdown "
+    "ส่วนแรก: บรรทัดแรกเขียนว่า [Style] แล้วบรรทัดถัดมาเขียนสไตล์เพลงภาษาอังกฤษบรรทัดเดียว "
+    "ที่เหมาะกับเพลงนี้ที่สุด ระบุภาษา แนวเพลง เสียงร้อง จังหวะ BPM อารมณ์ และเครื่องดนตรี "
+    "ตัวอย่างรูปแบบ: Thai, upbeat acoustic pop, warm female vocal, 96 BPM, heartfelt, "
+    "acoustic guitar and soft piano "
+    "ส่วนที่สอง: เนื้อร้องภาษาไทย จัดทุกท่อนด้วยแท็กวงเล็บเหลี่ยมบนบรรทัดของตัวเองในรูปแบบ "
+    "[Verse 1], [Chorus], [Verse 2], [Bridge], [Outro] "
     "ต้องเริ่มด้วย [Verse 1] และมีท่อน [Chorus] อย่างน้อยหนึ่งท่อน "
     "แต่ละท่อนมี 4-8 บรรทัด รวมความยาวพอเหมาะกับเพลง 1-2 นาที "
-    "เขียนให้ร้องได้จริง มีคำสัมผัส จำง่าย และเข้ากับแนวเพลงที่ผู้ใช้กำหนด"
+    "เขียนให้ร้องได้จริง มีคำสัมผัส จำง่าย และเข้ากับสไตล์ที่เลือก"
 )
 
 
