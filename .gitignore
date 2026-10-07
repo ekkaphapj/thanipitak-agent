@@ -6,10 +6,13 @@ venv/
 .env.*
 !.env.example
 *.log
+test_run.log
+test_exit.txt
 ComfyUI/
 models/
 output/
 input/draw_refs/
+user_data/
 *.safetensors
 *.gguf
 *.ckpt

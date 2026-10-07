@@ -8,6 +8,7 @@ Both async patterns keep HTTP responses short so Cloudflare never times out.
 """
 import base64
 import binascii
+import hashlib
 import hmac
 import html
 import io
@@ -16,16 +17,18 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
-import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -43,8 +46,10 @@ FLUX_VAE = "flux2-vae.safetensors"
 MODEL_ROOT = Path(os.environ.get("COMFY_MODEL_ROOT", str(COMFY_HOME / "models")))
 HOST = os.environ.get("DRAW_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DRAW_PORT", "8190"))
-# Shared-password gate: the browser trades DRAW_PASSWORD for a bearer token.
-DRAW_PASSWORD = os.environ.get("DRAW_PASSWORD", "thanipitak1")
+# Personal accounts replace the old shared password. Registration lands in a
+# pending state; an admin opens /approve, enters APPROVE_CODE and approves.
+APPROVE_CODE = os.environ.get("APPROVE_CODE") \
+    or os.environ.get("DRAW_PASSWORD") or "thanipitak1"
 SESSION_TTL = 30 * 24 * 3600  # seconds before the browser must log in again
 # Optional OpenAI-compatible chat endpoint (Ollama/LM Studio/vLLM) that turns
 # Thai prompts into detailed English ones. Empty = prompts pass through as-is.
@@ -144,12 +149,381 @@ MODELS = {
 
 JOBS = {}
 LOCK = threading.Lock()
-SESSIONS = {}  # bearer token -> expiry; a server restart logs everyone out
+SESSIONS = {}  # bearer token -> {exp, username, admin}; restart logs everyone out
 SESSION_LOCK = threading.Lock()
 HERE = Path(__file__).resolve().parent
 PROMPT_CACHE = {}
 PROMPT_CACHE_MAX = 256
 CHAT_CAPABILITY_CACHE = {}
+
+# ---- accounts & per-user library (SQLite + one folder per user) -------------
+# Everything a user produces is kept forever in DATA_DIR: chat text in the
+# database, images/music as files under users/<username>/. The 50MB quota
+# counts both, and the web UI shows what is left.
+DATA_DIR = Path(os.environ.get("THANIPITAK_DATA_DIR", str(HERE / "user_data")))
+DB_PATH = DATA_DIR / "users.db"
+USERS_DIR = DATA_DIR / "users"
+USER_QUOTA = max(1, int(os.environ.get("USER_QUOTA_MB", "50"))) * 1024 * 1024
+# Reentrant: helpers like save_chat_exchange hold it across db() calls,
+# and db() itself re-acquires it inside init_db().
+DB_LOCK = threading.RLock()
+DB_READY = False
+USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,32}$")
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fullname TEXT NOT NULL,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chat_sessions(
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chat_messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
+CREATE TABLE IF NOT EXISTS media(
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  rel_path TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id, kind);
+"""
+
+
+def init_db():
+    global DB_READY
+    with DB_LOCK:
+        if DB_READY:
+            return
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        try:
+            conn.executescript(SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
+        DB_READY = True
+
+
+@contextmanager
+def db():
+    init_db()
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return salt.hex() + "$" + digest.hex()
+
+
+def verify_password(password, stored):
+    try:
+        salt_hex, digest_hex = stored.split("$", 1)
+        salt, expected = bytes.fromhex(salt_hex), bytes.fromhex(digest_hex)
+    except ValueError:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return hmac.compare_digest(actual, expected)
+
+
+class PendingAccount(Exception):
+    """Raised at login when the account exists but is not approved yet."""
+
+
+def register_user(fullname, username, password):
+    """Create a pending account; raise ValueError with a Thai message."""
+    fullname = (fullname or "").strip()
+    username = (username or "").strip().lower()
+    password = password or ""
+    if not fullname:
+        raise ValueError("กรุณากรอกชื่อ-นามสกุล")
+    if len(fullname) > 120:
+        raise ValueError("ชื่อ-นามสกุลยาวเกิน 120 ตัวอักษร")
+    if not username:
+        raise ValueError("กรุณากรอก username")
+    if not USERNAME_RE.match(username):
+        raise ValueError("username ต้องเป็น a-z, 0-9, จุด, ขีด หรือ ขีดล่าง ความยาว 3-32 ตัวอักษร")
+    if not password:
+        raise ValueError("กรุณากรอกรหัสผ่าน")
+    if len(password) > 128:
+        raise ValueError("รหัสผ่านยาวเกิน 128 ตัวอักษร")
+    with DB_LOCK, db() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO users(fullname, username, password_hash, status, created_at)"
+                " VALUES(?,?,?,?,?)",
+                (fullname, username, hash_password(password), "pending", time.time()))
+        except sqlite3.IntegrityError:
+            raise ValueError("username นี้ถูกใช้ไปแล้ว กรุณาเลือกใหม่")
+    return username
+
+
+def login_user(username, password):
+    """Return the user row for valid, approved credentials."""
+    username = (username or "").strip().lower()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not isinstance(row, sqlite3.Row) or not verify_password(password or "", row["password_hash"]):
+        time.sleep(0.8)  # blunt credential guessing through the tunnel
+        raise ValueError("username หรือรหัสผ่านไม่ถูกต้อง")
+    if row["status"] != "approved":
+        raise PendingAccount()
+    return row
+
+
+def get_user_by_username(username):
+    with db() as conn:
+        return conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+
+
+def pending_users():
+    with db() as conn:
+        return conn.execute(
+            "SELECT id, fullname, username, created_at FROM users WHERE status='pending'"
+            " ORDER BY created_at").fetchall()
+
+
+def approve_user(username, approved=True):
+    with DB_LOCK, db() as conn:
+        if approved:
+            cur = conn.execute("UPDATE users SET status='approved' WHERE username=?",
+                               (username,))
+        else:
+            cur = conn.execute("DELETE FROM users WHERE username=? AND status='pending'",
+                               (username,))
+    return cur.rowcount > 0
+
+
+def create_session(username=None, admin=False):
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with SESSION_LOCK:
+        for stale, sess in list(SESSIONS.items()):
+            if sess["exp"] <= now:
+                SESSIONS.pop(stale, None)
+        SESSIONS[token] = {"exp": now + SESSION_TTL, "username": username,
+                           "admin": admin}
+    return token
+
+
+def session_info(token):
+    with SESSION_LOCK:
+        sess = SESSIONS.get(token or "")
+    if not sess or sess["exp"] <= time.time():
+        return None
+    return dict(sess)
+
+
+def session_valid(token):
+    return session_info(token) is not None
+
+
+def used_bytes(user_id):
+    """Storage the user's library takes: media files plus chat text."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT (SELECT COALESCE(SUM(bytes),0) FROM media WHERE user_id=?)"
+            " + (SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))),0)"
+            "    FROM chat_messages WHERE user_id=?) AS used", (user_id, user_id)).fetchone()
+    return int(row["used"])
+
+
+def storage_summary(user_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN kind='image' THEN bytes END),0) AS images,"
+            " COALESCE(SUM(CASE WHEN kind='music' THEN bytes END),0) AS music,"
+            " COUNT(CASE WHEN kind='image' THEN 1 END) AS image_count,"
+            " COUNT(CASE WHEN kind='music' THEN 1 END) AS music_count"
+            " FROM media WHERE user_id=?", (user_id,)).fetchone()
+        chat = conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))),0) AS bytes,"
+            " COUNT(*) AS messages FROM chat_messages WHERE user_id=?",
+            (user_id,)).fetchone()
+    used = int(row["images"]) + int(row["music"]) + int(chat["bytes"])
+    return {"quota": USER_QUOTA, "used": used, "remaining": max(0, USER_QUOTA - used),
+            "images_bytes": int(row["images"]), "music_bytes": int(row["music"]),
+            "chats_bytes": int(chat["bytes"]),
+            "image_count": int(row["image_count"]), "music_count": int(row["music_count"]),
+            "chat_messages": int(chat["messages"])}
+
+
+def user_library(user_id):
+    """Chat sessions plus saved images/music for the sidebar and manage tab."""
+    with db() as conn:
+        chats = conn.execute(
+            "SELECT s.id, s.title, s.updated_at,"
+            " (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id=s.id) AS messages"
+            " FROM chat_sessions s WHERE s.user_id=? ORDER BY s.updated_at DESC",
+            (user_id,)).fetchall()
+        media = conn.execute(
+            "SELECT id, kind, filename, bytes, note, created_at FROM media"
+            " WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
+    return {
+        "chats": [{"id": r["id"], "title": r["title"], "updated_at": r["updated_at"],
+                   "messages": int(r["messages"])} for r in chats],
+        "images": [_media_row(r) for r in media if r["kind"] == "image"],
+        "music": [_media_row(r) for r in media if r["kind"] == "music"],
+    }
+
+
+def _media_row(row):
+    return {"id": row["id"], "filename": row["filename"], "bytes": int(row["bytes"]),
+            "note": row["note"], "created_at": row["created_at"],
+            "url": "/api/media/" + row["id"] + "/file"}
+
+
+def unique_media_name(conn, username, kind, ext):
+    """username+picture-thanipitak.png / username+music-thanipitak.mp3, then -2, -3…"""
+    base = f"{username}+{'picture' if kind == 'image' else 'music'}-thanipitak"
+    name = base + ext
+    n = 2
+    while conn.execute("SELECT 1 FROM media WHERE filename=?", (name,)).fetchone() \
+            or (USERS_DIR / username / ("images" if kind == "image" else "music") / name).exists():
+        name = f"{base}-{n}{ext}"
+        n += 1
+    return name
+
+
+def archive_job_output(user, kind, source_path, note):
+    """Copy a finished ComfyUI output into the user's library under quota.
+
+    Returns the media id, or None when there is no room left (the job still
+    succeeds — the browser just warns the file is not in the library).
+    """
+    user_id, username = user
+    try:
+        size = source_path.stat().st_size
+    except OSError:
+        return None
+    if used_bytes(user_id) + size > USER_QUOTA:
+        return None
+    ext = source_path.suffix.lower() or (".png" if kind == "image" else ".mp3")
+    sub = "images" if kind == "image" else "music"
+    dest_dir = USERS_DIR / username / sub
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    media_id = uuid.uuid4().hex[:12]
+    with DB_LOCK, db() as conn:
+        filename = unique_media_name(conn, username, kind, ext)
+        dest = dest_dir / filename
+        try:
+            shutil.copy2(source_path, dest)
+        except OSError:
+            return None
+        conn.execute(
+            "INSERT INTO media(id, user_id, kind, filename, rel_path, bytes, note, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (media_id, user_id, kind, filename,
+             f"{username}/{sub}/{filename}", dest.stat().st_size,
+             (note or "").strip()[:200], time.time()))
+    return media_id
+
+
+def delete_media(user_id, media_id=None, kind=None):
+    """Remove one media row (or every row of a kind) plus its file."""
+    with DB_LOCK, db() as conn:
+        if media_id is not None:
+            rows = conn.execute("SELECT * FROM media WHERE user_id=? AND id=?",
+                                (user_id, media_id)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM media WHERE user_id=? AND kind=?",
+                                (user_id, kind)).fetchall()
+        for row in rows:
+            conn.execute("DELETE FROM media WHERE id=?", (row["id"],))
+    for row in rows:
+        target = DATA_DIR / "users" / row["rel_path"]
+        try:
+            target.unlink()
+        except OSError:
+            pass
+    return len(rows)
+
+
+def chat_title(text):
+    line = (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
+    return (line[:60] or "แชตใหม่")
+
+
+def ensure_chat_session(user_id, session_id, title_seed):
+    """Validate a session id from the browser or open a new one."""
+    with DB_LOCK, db() as conn:
+        if session_id:
+            row = conn.execute("SELECT id FROM chat_sessions WHERE id=? AND user_id=?",
+                               (session_id, user_id)).fetchone()
+            if row:
+                return session_id
+        sid = uuid.uuid4().hex[:12]
+        conn.execute(
+            "INSERT INTO chat_sessions(id, user_id, title, created_at, updated_at)"
+            " VALUES(?,?,?,?,?)", (sid, user_id, chat_title(title_seed), time.time(), time.time()))
+    return sid
+
+
+def save_chat_exchange(user_id, session_id, user_text, assistant_text):
+    """Store one question+answer pair; skip silently when the quota is full."""
+    needed = len(user_text.encode("utf-8")) + len(assistant_text.encode("utf-8"))
+    with DB_LOCK, db() as conn:
+        used = used_bytes(user_id)
+        if used + needed > USER_QUOTA:
+            return False
+        now = time.time()
+        conn.execute(
+            "INSERT INTO chat_messages(session_id, user_id, role, content, created_at)"
+            " VALUES(?,?,?,?,?), (?,?,?,?,?)",
+            (session_id, user_id, "user", user_text, now,
+             session_id, user_id, "assistant", assistant_text, now))
+        conn.execute("UPDATE chat_sessions SET updated_at=? WHERE id=?", (now, session_id))
+    return True
+
+
+def chat_messages(user_id, session_id):
+    with db() as conn:
+        owner = conn.execute("SELECT id FROM chat_sessions WHERE id=? AND user_id=?",
+                             (session_id, user_id)).fetchone()
+        if not owner:
+            return None
+        rows = conn.execute(
+            "SELECT role, content FROM chat_messages WHERE session_id=? ORDER BY id",
+            (session_id,)).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+def delete_chat_session(user_id, session_id=None):
+    with DB_LOCK, db() as conn:
+        if session_id is not None:
+            cur = conn.execute("DELETE FROM chat_sessions WHERE id=? AND user_id=?",
+                               (session_id, user_id))
+            conn.execute("DELETE FROM chat_messages WHERE session_id=?", (session_id,))
+        else:
+            cur = conn.execute("DELETE FROM chat_sessions WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM chat_messages WHERE user_id=?", (user_id,))
+    return cur.rowcount
+
 
 
 class QueueGate:
@@ -1037,7 +1411,7 @@ def build_yue2_graph(style, lyrics, seconds, seed, planning=True):
     return graph
 
 
-def run_music_job(job_id, spec):
+def run_music_job(job_id, spec, user=None):
     ticket = COMFY_GATE.reserve()
     granted = False
     queue_deadline = time.time() + QUEUE_WAIT_TIMEOUT
@@ -1086,11 +1460,24 @@ def run_music_job(job_id, spec):
                 for output in item.get("outputs", {}).values():
                     for audio in output.get("audio", output.get("images", [])):
                         if audio.get("type") == "output":
+                            subfolder = audio.get("subfolder", "")
                             with LOCK:
                                 JOBS[job_id]["file"] = audio["filename"]
-                                JOBS[job_id]["subfolder"] = audio.get("subfolder", "")
+                                JOBS[job_id]["subfolder"] = subfolder
                                 JOBS[job_id]["status"] = "done"
                                 JOBS[job_id]["finished"] = time.time()
+                            if user:
+                                source = (OUTPUT_DIR / subfolder / audio["filename"]) \
+                                    if subfolder else (OUTPUT_DIR / audio["filename"])
+                                note = "สไตล์: " + spec["style"]
+                                if spec.get("lyrics"):
+                                    note += "\nเนื้อร้อง: " + spec["lyrics"]
+                                media_id = archive_job_output(user, "music", source, note)
+                                with LOCK:
+                                    if media_id:
+                                        JOBS[job_id]["media_id"] = media_id
+                                    else:
+                                        JOBS[job_id]["quota_full"] = True
                             return
                 raise RuntimeError("finished but no output audio found")
         raise RuntimeError("timeout waiting for ComfyUI")
@@ -1105,7 +1492,7 @@ def run_music_job(job_id, spec):
             COMFY_GATE.cancel(ticket)
 
 
-def run_job(job_id, spec, ref_path=None):
+def run_job(job_id, spec, ref_path=None, user=None):
     ticket = COMFY_GATE.reserve()
     granted = False
     queue_deadline = time.time() + QUEUE_WAIT_TIMEOUT
@@ -1170,6 +1557,15 @@ def run_job(job_id, spec, ref_path=None):
                                 JOBS[job_id]["file"] = img["filename"]
                                 JOBS[job_id]["status"] = "done"
                                 JOBS[job_id]["finished"] = time.time()
+                            if user:
+                                media_id = archive_job_output(
+                                    user, "image", OUTPUT_DIR / img["filename"],
+                                    spec["prompt"])
+                                with LOCK:
+                                    if media_id:
+                                        JOBS[job_id]["media_id"] = media_id
+                                    else:
+                                        JOBS[job_id]["quota_full"] = True
                             return
                 raise RuntimeError("finished but no output image found")
         raise RuntimeError("timeout waiting for ComfyUI")
@@ -1189,22 +1585,6 @@ def run_job(job_id, spec, ref_path=None):
                 pass
 
 
-def create_session():
-    token = secrets.token_urlsafe(32)
-    now = time.time()
-    with SESSION_LOCK:
-        for stale, expiry in list(SESSIONS.items()):
-            if expiry <= now:
-                SESSIONS.pop(stale, None)
-        SESSIONS[token] = now + SESSION_TTL
-    return token
-
-
-def session_valid(token):
-    with SESSION_LOCK:
-        return bool(token) and SESSIONS.get(token, 0) > time.time()
-
-
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8",
               cache=None):
@@ -1222,29 +1602,110 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _authorized(self):
+    def _session(self):
         header = self.headers.get("Authorization", "")
         scheme, _, token = header.partition(" ")
-        return scheme.lower() == "bearer" and session_valid(token.strip())
+        if scheme.lower() != "bearer":
+            return None
+        return session_info(token.strip())
 
-    def _handle_login(self):
+    def _authorized(self):
+        return self._session() is not None
+
+    def _is_admin(self):
+        info = self._session()
+        return bool(info and info["admin"])
+
+    def _read_json(self, limit):
         try:
             length = int(self.headers.get("Content-Length", 0))
-            if length <= 0 or length > 65536:
+            if length <= 0 or length > limit:
                 raise ValueError("invalid body length")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
-            if not isinstance(body, dict) or not isinstance(body.get("password"), str):
+            if not isinstance(body, dict):
                 raise ValueError("invalid body")
+            return body
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             self._send(400, {"error": "invalid json"})
-            return
-        if not hmac.compare_digest(body["password"].encode(), DRAW_PASSWORD.encode()):
-            time.sleep(0.8)  # blunt password guessing through the tunnel
-            self._send(401, {"error": "รหัสผ่านไม่ถูกต้อง"})
-            return
-        self._send(200, {"token": create_session(), "expires_in": SESSION_TTL})
+            return None
 
-    def _stream_chat(self, model_id, messages, notes):
+    def _current_user(self):
+        """The approved account behind this request's token, or None."""
+        info = self._session()
+        if not info or not info.get("username"):
+            return None
+        return get_user_by_username(info["username"])
+
+    def _handle_login(self):
+        body = self._read_json(65536)
+        if body is None:
+            return
+        username = body.get("username")
+        password = body.get("password")
+        if not isinstance(username, str) or not isinstance(password, str) \
+                or not username.strip() or not password:
+            self._send(400, {"error": "กรุณากรอก username และรหัสผ่าน"})
+            return
+        try:
+            user = login_user(username, password)
+        except PendingAccount:
+            self._send(403, {"error": "บัญชีนี้ยังรอการอนุมัติจากผู้ดูแลระบบ"})
+            return
+        except ValueError as e:
+            self._send(401, {"error": str(e)})
+            return
+        self._send(200, {"token": create_session(username=user["username"]),
+                         "expires_in": SESSION_TTL,
+                         "username": user["username"], "fullname": user["fullname"]})
+
+    def _handle_register(self):
+        body = self._read_json(65536)
+        if body is None:
+            return
+        try:
+            username = register_user(body.get("fullname"), body.get("username"),
+                                     body.get("password"))
+        except ValueError as e:
+            self._send(400, {"error": str(e)})
+            return
+        self._send(200, {"ok": True, "username": username,
+                         "message": "ส่งคำขอสมัครแล้ว รอผู้ดูแลระบบอนุมัติก่อนจึงจะเข้าสู่ระบบได้"})
+
+    def _handle_approve_login(self):
+        body = self._read_json(65536)
+        if body is None:
+            return
+        code = body.get("code")
+        if not isinstance(code, str) or not hmac.compare_digest(
+                code.encode(), APPROVE_CODE.encode()):
+            time.sleep(0.8)
+            self._send(401, {"error": "รหัสหน้าอนุมัติไม่ถูกต้อง"})
+            return
+        self._send(200, {"token": create_session(admin=True), "expires_in": SESSION_TTL})
+
+    def _handle_admin_pending(self):
+        rows = pending_users()
+        self._send(200, {"pending": [
+            {"id": r["id"], "fullname": r["fullname"], "username": r["username"],
+             "created_at": r["created_at"]} for r in rows]})
+
+    def _handle_admin_decision(self, approved):
+        body = self._read_json(65536)
+        if body is None:
+            return
+        username = str(body.get("username") or "").strip().lower()
+        if not username or not approve_user(username, approved):
+            self._send(404, {"error": "ไม่พบบัญชีนี้"})
+            return
+        self._send(200, {"ok": True,
+                         "message": "อนุมัติบัญชีแล้ว" if approved else "ลบคำขอสมัครแล้ว"})
+
+    def _stream_chat(self, model_id, messages, notes, persist=None):
+        """Stream one Ollama answer as NDJSON.
+
+        persist (chat tab only) = {"user_id", "session", "user_text"}: the
+        exchange is written to the user's history once the answer completes.
+        """
         payload = {"model": model_id, "messages": messages,
                    "stream": True, "think": False,
                    "keep_alive": CHAT_KEEP_ALIVE,
@@ -1260,6 +1721,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         wlock = threading.Lock()
         stopped = threading.Event()
+        full_parts = []
 
         def emit(obj):
             with wlock:
@@ -1288,6 +1750,12 @@ class Handler(BaseHTTPRequestHandler):
                 emit({"notes": notes})
             # Keep browser document context identical to what Ollama sees.
             emit({"user_content": messages[-1]["content"]})
+            if persist:
+                # Resolve (or open) the history session up front so the browser
+                # can keep sending follow-up turns under the same id.
+                persist["session"] = ensure_chat_session(
+                    persist["user_id"], persist.get("session"), persist.get("user_text"))
+                emit({"chat_session": persist["session"]})
             # Chat lane: one generation at a time; report the live position
             # while waiting so the browser can show "you are Nth in queue".
             ticket = None
@@ -1328,6 +1796,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise RuntimeError(str(chunk["error"]))
                     delta = chunk.get("message", {}).get("content", "")
                     if delta:
+                        full_parts.append(delta)
                         emit({"delta": delta})
                     if chunk.get("done"):
                         usage = {"ctx": chat_num_ctx(model_id)}
@@ -1340,6 +1809,12 @@ class Handler(BaseHTTPRequestHandler):
                                 chunk.get("finish_reason") == "length":
                             emit({"truncated": True})
                         emit({"done": True})
+                        if persist:
+                            saved = save_chat_exchange(
+                                persist["user_id"], persist["session"],
+                                persist.get("user_text") or "", "".join(full_parts))
+                            if not saved:
+                                emit({"chat_saved": False})
                         return
             raise RuntimeError("Ollama ปิดการเชื่อมต่อก่อนตอบเสร็จ กรุณาลองอีกครั้ง")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -1362,11 +1837,19 @@ class Handler(BaseHTTPRequestHandler):
         if route in ("/", "/index.html"):
             html = (HERE / "index.html").read_text(encoding="utf-8")
             self._send(200, html, "text/html; charset=utf-8", cache="no-cache")
+        elif route in ("/approve", "/approve.html"):
+            html = (HERE / "approve.html").read_text(encoding="utf-8")
+            self._send(200, html, "text/html; charset=utf-8", cache="no-cache")
         elif route == "/api/session":
-            if self._authorized():
-                self._send(200, {"ok": True})
-            else:
+            info = self._session()
+            if not info:
                 self._send(401, {"error": "ต้องเข้าสู่ระบบก่อนใช้งาน"})
+                return
+            user = get_user_by_username(info["username"]) if info.get("username") else None
+            self._send(200, {"ok": True,
+                             "username": info.get("username"),
+                             "fullname": user["fullname"] if user else None,
+                             "admin": bool(info.get("admin"))})
         elif route.startswith("/api/") and not self._authorized():
             self._send(401, {"error": "ต้องเข้าสู่ระบบก่อนใช้งาน"})
         elif route == "/api/health":
@@ -1383,10 +1866,55 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/queue":
             self._send(200, {"comfy": COMFY_GATE.snapshot(),
                              "chat": CHAT_GATE.snapshot()})
+        elif route == "/api/storage":
+            user = self._current_user()
+            if not user:
+                self._send(403, {"error": "บัญชีนี้ใช้งานห้องแชตเท่านั้น"})
+                return
+            self._send(200, storage_summary(user["id"]))
+        elif route == "/api/library":
+            user = self._current_user()
+            if not user:
+                self._send(403, {"error": "บัญชีนี้ใช้งานห้องแชตเท่านั้น"})
+                return
+            self._send(200, user_library(user["id"]))
+        elif route == "/api/admin/pending":
+            if not self._is_admin():
+                self._send(403, {"error": "ต้องเข้าสู่ระบบหน้าอนุมัติก่อน"})
+                return
+            self._handle_admin_pending()
+        elif route.startswith("/api/chats/"):
+            user = self._current_user()
+            jid = route.rsplit("/", 1)[-1]
+            messages = chat_messages(user["id"], jid) if user else None
+            if messages is None:
+                self._send(404, {"error": "ไม่พบบทสนทนานี้"})
+                return
+            self._send(200, {"id": jid, "messages": messages})
+        elif route.startswith("/api/media/") and route.endswith("/file"):
+            user = self._current_user()
+            mid = route[len("/api/media/"):-len("/file")]
+            with db() as conn:
+                row = conn.execute("SELECT * FROM media WHERE id=? AND user_id=?",
+                                   (mid, user["id"] if user else -1)).fetchone()
+            if not row:
+                self._send(404, {"error": "ไม่พบไฟล์นี้"})
+                return
+            target = (DATA_DIR / "users" / row["rel_path"]).resolve()
+            if not str(target).startswith(str((DATA_DIR / "users").resolve())) or not target.is_file():
+                self._send(404, {"error": "ไฟล์หายไปแล้ว"})
+                return
+            ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                     ".webp": "image/webp", ".mp3": "audio/mpeg",
+                     ".wav": "audio/wav"}.get(target.suffix.lower(),
+                                              "application/octet-stream")
+            self._send(200, target.read_bytes(), ctype, cache="no-cache")
         elif route.startswith("/api/status/"):
             jid = route.rsplit("/", 1)[-1]
             with LOCK:
                 job = dict(JOBS.get(jid, {}))
+            for private in ("user_id", "username"):
+                job.pop(private, None)
             job.setdefault("status", "unknown")
             if job.get("status") in ("queued", "running") and job.get("prompt_id"):
                 ahead = comfy_jobs_ahead(job["prompt_id"])
@@ -1431,8 +1959,20 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/login":
             self._handle_login()
             return
+        if route == "/api/register":
+            self._handle_register()
+            return
+        if route == "/api/approve/login":
+            self._handle_approve_login()
+            return
         if route.startswith("/api/") and not self._authorized():
             self._send(401, {"error": "ต้องเข้าสู่ระบบก่อนใช้งาน"})
+            return
+        if route in ("/api/admin/approve", "/api/admin/reject"):
+            if not self._is_admin():
+                self._send(403, {"error": "ต้องเข้าสู่ระบบหน้าอนุมัติก่อน"})
+                return
+            self._handle_admin_decision(route.endswith("approve"))
             return
         if route == "/api/chat":
             self._handle_chat()
@@ -1502,6 +2042,7 @@ class Handler(BaseHTTPRequestHandler):
         if resolution not in RESOLUTIONS:
             resolution = 1024
         job_id = uuid.uuid4().hex[:12]
+        owner = self._job_owner()
         reference = None
         if body.get("reference"):
             try:
@@ -1515,11 +2056,19 @@ class Handler(BaseHTTPRequestHandler):
                 "model_id": model_id}
         with LOCK:
             JOBS[job_id] = {"status": "queued", "profile": profile,
-                            "model": model_id, "ts": time.time()}
+                            "model": model_id, "ts": time.time(),
+                            "user_id": owner and owner[0],
+                            "username": owner and owner[1]}
             for old in [j for j, v in JOBS.items() if time.time() - v["ts"] > 3600]:
                 JOBS.pop(old, None)
-        threading.Thread(target=run_job, args=(job_id, spec, ref_path), daemon=True).start()
+        threading.Thread(target=run_job, args=(job_id, spec, ref_path, owner),
+                         daemon=True).start()
         self._send(200, {"id": job_id, "profile": profile, "model": model_id})
+
+    def _job_owner(self):
+        """(user_id, username) of the caller, or None for admin-only tokens."""
+        user = self._current_user()
+        return (user["id"], user["username"]) if user else None
 
     def _handle_music(self):
         try:
@@ -1560,14 +2109,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         planning = body.get("planning", True) is not False
         job_id = uuid.uuid4().hex[:12]
+        owner = self._job_owner()
         with LOCK:
-            JOBS[job_id] = {"status": "queued", "kind": "music", "ts": time.time()}
+            JOBS[job_id] = {"status": "queued", "kind": "music", "ts": time.time(),
+                            "user_id": owner and owner[0],
+                            "username": owner and owner[1]}
             for old in [j for j, v in JOBS.items()
                         if time.time() - v["ts"] > 4 * 3600]:
                 JOBS.pop(old, None)
         threading.Thread(target=run_music_job, args=(job_id, {
             "style": style, "lyrics": lyrics, "seconds": seconds,
-            "seed": seed, "planning": planning}), daemon=True).start()
+            "seed": seed, "planning": planning}, owner), daemon=True).start()
         self._send(200, {"id": job_id, "seed": seed})
 
     def _handle_memory_clear(self):
@@ -1634,7 +2186,25 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "โมเดลที่เลือกไม่รองรับรูปภาพ กรุณาเลือกโมเดลที่มีป้าย 'เห็นภาพ'"})
             return
         notes = pdf_notes + (notes or [])
-        self._stream_chat(model_id, messages, notes)
+        # Auto-archive: keep the question (plus a note about attachments) and,
+        # once the stream completes, the answer in the user's history.
+        persist = None
+        user = self._current_user()
+        if user:
+            last = raw_messages[-1] if raw_messages else {}
+            user_text = str(last.get("content") or "").strip()
+            markers = []
+            if last.get("images"):
+                markers.append(f"รูป {len(last['images'])} ไฟล์")
+            if last.get("docs"):
+                markers.append(f"เอกสาร {len(last['docs'])} ไฟล์")
+            if markers:
+                user_text = (user_text + "\n" if user_text else "") + "[แนบ: " + ", ".join(markers) + "]"
+            session_id = body.get("chat_session")
+            persist = {"user_id": user["id"],
+                       "session": session_id if isinstance(session_id, str) else None,
+                       "user_text": user_text}
+        self._stream_chat(model_id, messages, notes, persist)
 
     def _handle_lyrics(self):
         """Write YuE2-ready lyrics with a local chat model; streams like /api/chat.
@@ -1684,9 +2254,45 @@ class Handler(BaseHTTPRequestHandler):
             {"role": "user", "content": user_content},
         ], [])
 
+    def do_DELETE(self):
+        """Manage-content endpoints: remove chats or library files."""
+        route, _, query = self.path.partition("?")
+        if route.startswith("/api/") and not self._authorized():
+            self._send(401, {"error": "ต้องเข้าสู่ระบบก่อนใช้งาน"})
+            return
+        user = self._current_user()
+        if not user:
+            self._send(403, {"error": "บัญชีนี้ใช้งานห้องแชตเท่านั้น"})
+            return
+        params = urllib.parse.parse_qs(query)
+        if route == "/api/chats":
+            self._send(200, {"removed": delete_chat_session(user["id"])})
+        elif route.startswith("/api/chats/"):
+            jid = route.rsplit("/", 1)[-1]
+            removed = delete_chat_session(user["id"], jid)
+            if not removed:
+                self._send(404, {"error": "ไม่พบบทสนทนานี้"})
+                return
+            self._send(200, {"removed": removed})
+        elif route == "/api/media":
+            kind = (params.get("kind") or [""])[0]
+            if kind not in ("images", "music"):
+                self._send(400, {"error": "ต้องระบุ kind=images หรือ music"})
+                return
+            self._send(200, {"removed": delete_media(user["id"], kind=kind[:-1])})
+        elif route.startswith("/api/media/"):
+            mid = route.rsplit("/", 1)[-1]
+            if not delete_media(user["id"], media_id=mid):
+                self._send(404, {"error": "ไม่พบไฟล์นี้"})
+                return
+            self._send(200, {"removed": 1})
+        else:
+            self._send(404, {"error": "not found"})
+
     def log_message(self, *args):
         pass
 
 
 if __name__ == "__main__":
+    init_db()
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

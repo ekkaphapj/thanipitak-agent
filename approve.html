@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#111114">
+<title>หน้าอนุมัติสมาชิก - THANIPITAK AI</title>
+<style>
+:root{color-scheme:dark;font-family:"Segoe UI",Tahoma,system-ui,sans-serif;background:#111114;color:#f5f3f2}
+*{box-sizing:border-box}body{margin:0;min-width:320px;min-height:100vh;background:radial-gradient(circle at 72% -18%,rgba(189,36,35,.2),transparent 38rem),linear-gradient(160deg,#171719,#101012 60%)}
+button,input{font:inherit}button{-webkit-tap-highlight-color:transparent}
+button:focus-visible,input:focus-visible{outline:2px solid #ff766f;outline-offset:3px}
+.shell{width:min(680px,calc(100% - 40px));margin:auto;padding:40px 0 60px}
+.eyebrow{margin:0 0 3px;color:#ef736e;font-size:12px;font-weight:800;letter-spacing:.12em}
+h1{margin:0;font-size:clamp(20px,3vw,28px);letter-spacing:-.02em}
+.note-line{margin:6px 0 24px;color:#aaa7a9;font-size:13px;line-height:1.6}
+.card{border:1px solid #3a3537;border-radius:20px;background:#202023;box-shadow:0 20px 55px rgba(0,0,0,.16);padding:26px}
+label{display:block;margin:0 0 8px;font-size:14px;font-weight:650;color:#f0eded}
+input{display:block;width:100%;padding:14px 15px;border:1px solid #5b5557;border-radius:12px;color:#fff;background:#151517;font-size:16px}
+input:focus{border-color:#ed5d55}
+.primary{display:flex;justify-content:center;align-items:center;gap:9px;width:100%;min-height:52px;margin-top:18px;padding:12px 16px;border:1px solid #f87c70;border-radius:12px;background:linear-gradient(110deg,#a81819,#df3931);color:#fff;font-size:16px;font-weight:800;cursor:pointer;box-shadow:0 10px 25px rgba(169,24,25,.24)}
+.primary:hover:not(:disabled){filter:brightness(1.12)}.primary:disabled{opacity:.62;cursor:wait}
+.ghost-btn{padding:8px 12px;border:1px solid #514749;border-radius:10px;background:transparent;color:#c9a5a2;font-size:12px;cursor:pointer}
+.ghost-btn:hover{background:#3b2929}
+.ok-btn{padding:8px 14px;border:1px solid #3f7a44;border-radius:10px;background:#1d3320;color:#bde6c3;font-size:13px;font-weight:700;cursor:pointer}
+.ok-btn:hover{filter:brightness(1.15)}
+.err{min-height:20px;margin:10px 0 0;color:#ff8f88;font-size:13px}
+.row{display:flex;align-items:center;gap:12px;padding:13px 14px;border:1px solid #453d3f;border-radius:12px;background:#1b1b1e;margin-top:9px}
+.row .who{flex:1;min-width:0}
+.row .who strong{display:block;font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .who small{color:#9d979a;font-size:12px}
+h2{margin:0 0 4px;font-size:17px}
+.pending-list{margin-top:12px}
+.empty{color:#9d979a;font-size:13.5px;margin:14px 0 0}
+.actions{display:flex;gap:14px;justify-content:space-between;align-items:center;margin-top:22px;padding-top:16px;border-top:1px solid #393537}
+.back{color:#e7aaa5;font-size:13px;text-decoration:none;text-underline-offset:3px}
+.status-line{margin:14px 0 0;color:#ffd39d;font-size:13px;min-height:18px}
+@media(max-width:580px){.shell{width:min(100% - 26px,480px)}.card{padding:18px}.row{flex-wrap:wrap}.row .who{flex-basis:100%}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <p class="eyebrow">THANI PITAK AI · ADMIN</p>
+  <h1>หน้าอนุมัติสมาชิก</h1>
+  <p class="note-line">ปลดล็อกหน้านี้ด้วยรหัสผู้ดูแล แล้วกดอนุมัติคำขอสมัครที่รออยู่</p>
+
+  <section class="card" id="code-card">
+    <label for="approve-code">รหัสเข้าหน้าอนุมัติ</label>
+    <input type="password" id="approve-code" autocomplete="off" placeholder="รหัสผู้ดูแลระบบ">
+    <button class="primary" id="code-btn" type="button">ปลดล็อกหน้าอนุมัติ</button>
+    <p class="err" id="code-err" role="alert"></p>
+  </section>
+
+  <section class="card" id="admin-card" hidden>
+    <h2>คำขอสมัครที่รออนุมัติ</h2>
+    <p class="note-line" style="margin-bottom:6px">กด "อนุมัติ" เพื่อให้ผู้ใช้เข้าสู่ระบบได้ หรือ "ปฏิเสธ" เพื่อลบคำขอ</p>
+    <div class="pending-list" id="pending-list"></div>
+    <p class="empty" id="pending-empty" hidden>ไม่มีคำขอที่รออนุมัติ 🎉</p>
+    <p class="status-line" id="admin-status" role="status" aria-live="polite"></p>
+    <div class="actions">
+      <button class="ghost-btn" id="refresh-btn" type="button">↻ รีเฟรชรายการ</button>
+      <button class="ghost-btn" id="logout-btn" type="button">ออกจากหน้าอนุมัติ</button>
+    </div>
+    <p style="margin:16px 0 0"><a class="back" href="/">← กลับหน้าหลัก</a></p>
+  </section>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let adminToken=sessionStorage.getItem("thani_admin_token")||null;
+async function api(path,body){
+  const headers={"Content-Type":"application/json"};
+  if(adminToken)headers.Authorization="Bearer "+adminToken;
+  const response=await fetch(path,body?{method:"POST",headers,body:JSON.stringify(body)}:{headers});
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(data.error||"คำขอไม่สำเร็จ");
+  return data;
+}
+function when(ts){return new Date(ts*1000).toLocaleString("th-TH",{day:"numeric",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})}
+async function unlock(){
+  const btn=$("code-btn");btn.disabled=true;$("code-err").textContent="";
+  try{
+    const data=await api("/api/approve/login",{code:$("approve-code").value});
+    adminToken=data.token;sessionStorage.setItem("thani_admin_token",adminToken);
+    $("approve-code").value="";
+    showAdmin();
+  }catch(error){$("code-err").textContent=error.message}
+  finally{btn.disabled=false}
+}
+$("code-btn").addEventListener("click",unlock);
+$("approve-code").addEventListener("keydown",event=>{if(event.key==="Enter")unlock()});
+function renderPending(rows){
+  const box=$("pending-list");box.replaceChildren();
+  $("pending-empty").hidden=!!rows.length;
+  for(const user of rows){
+    const row=document.createElement("div");row.className="row";
+    const who=document.createElement("div");who.className="who";
+    who.innerHTML="<strong></strong><small></small>";
+    who.querySelector("strong").textContent=user.fullname;
+    who.querySelector("small").textContent="@"+user.username+" · สมัครเมื่อ "+when(user.created_at);
+    const ok=document.createElement("button");ok.type="button";ok.className="ok-btn";ok.textContent="✓ อนุมัติ";
+    ok.addEventListener("click",()=>decide(user,true));
+    const no=document.createElement("button");no.type="button";no.className="ghost-btn";no.textContent="ปฏิเสธ";
+    no.addEventListener("click",()=>decide(user,false));
+    row.append(who,ok,no);box.appendChild(row);
+  }
+}
+async function decide(user,approved){
+  if(approved&&!confirm("อนุมัติบัญชี \""+user.fullname+"\" ("+user.username+")?"))return;
+  if(!approved&&!confirm("ปฏิเสธและลบคำขอของ \""+user.username+"\"?"))return;
+  try{
+    const data=await api(approved?"/api/admin/approve":"/api/admin/reject",{username:user.username});
+    $("admin-status").textContent=data.message||"ทำรายการสำเร็จ";
+    loadPending();
+  }catch(error){$("admin-status").textContent="ทำรายการไม่สำเร็จ: "+error.message}
+}
+async function loadPending(){
+  try{const data=await api("/api/admin/pending");renderPending(data.pending||[])}
+  catch(error){
+    if(error.message.includes("หน้าอนุมัติ")||error.message.includes("403"))lock();
+    else $("admin-status").textContent="โหลดรายการไม่สำเร็จ: "+error.message;
+  }
+}
+function showAdmin(){$("code-card").hidden=true;$("admin-card").hidden=false;loadPending()}
+function lock(){adminToken=null;sessionStorage.removeItem("thani_admin_token");$("admin-card").hidden=true;$("code-card").hidden=false;$("approve-code").focus()}
+$("refresh-btn").addEventListener("click",loadPending);
+$("logout-btn").addEventListener("click",lock);
+if(adminToken){api("/api/admin/pending").then(showAdmin).catch(lock)}
+else lock();
+</script>
+</body>
+</html>

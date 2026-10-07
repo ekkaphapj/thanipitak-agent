@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -14,6 +15,50 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import draw_server
+
+
+def post_json(base, path, body, token=None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(base + path, json.dumps(body).encode(),
+                                     headers, method="POST")
+    return urllib.request.urlopen(request, timeout=5)
+
+
+def approve_user_via_api(base, username, password="test-pass"):
+    """Register, approve with the admin code and log in; returns a token."""
+    try:
+        post_json(base, "/api/register", {"fullname": "Test User",
+                                          "username": username, "password": password})
+    except urllib.error.HTTPError as error:
+        if error.code != 400:  # a duplicate registration is fine on re-runs
+            raise
+    with post_json(base, "/api/approve/login", {"code": draw_server.APPROVE_CODE}) as r:
+        admin = json.load(r)["token"]
+    post_json(base, "/api/admin/approve", {"username": username}, token=admin)
+    with post_json(base, "/api/login", {"username": username,
+                                        "password": password}) as r:
+        return json.load(r)["token"]
+
+
+def login(base, username="tester"):
+    """Exchange credentials for a bearer token against a live server."""
+    return approve_user_via_api(base, username)
+
+
+def patch_draw_db(testcase):
+    """Point draw_server's SQLite + user-folder globals at a fresh temp dir."""
+    tmp = tempfile.TemporaryDirectory()
+    testcase.addCleanup(tmp.cleanup)
+    testcase.tmp = tmp  # tests drop fake ComfyUI outputs in here
+    root = Path(tmp.name)
+    for name, value in (("DATA_DIR", root), ("DB_PATH", root / "users.db"),
+                        ("USERS_DIR", root / "users"), ("DB_READY", False)):
+        patch = mock.patch.object(draw_server, name, value)
+        patch.start()
+        testcase.addCleanup(patch.stop)
+    return root
 
 
 class DrawGraphTest(unittest.TestCase):
@@ -552,21 +597,14 @@ class ChatNumCtxOverrideTest(unittest.TestCase):
             self.assertFalse(draw_server.chat_model_ready("wrongctx:latest"))
 
 
-def login(base):
-    """Exchange the shared password for a bearer token against a live server."""
-    request = urllib.request.Request(
-        base + "/api/login", json.dumps({"password": draw_server.DRAW_PASSWORD}).encode(),
-        {"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(request, timeout=5) as response:
-        return json.load(response)["token"]
-
-
 class ChatServerTest(unittest.TestCase):
     """Boots the real Handler with a stubbed Ollama catalog; shared by chat,
     lyrics and queue endpoint tests."""
 
     def setUp(self):
         draw_server.JOBS.clear()
+        # Fresh per-test SQLite + user folders so accounts never leak between tests
+        patch_draw_db(self)
         # Fresh gates so a test that times out mid-queue cannot leak state
         draw_server.COMFY_GATE = draw_server.QueueGate(
             "comfy", draw_server.QUEUE_MAX_COMFY)
@@ -1389,6 +1427,7 @@ class MusicGraphTest(unittest.TestCase):
 class MusicHttpTest(unittest.TestCase):
     def setUp(self):
         draw_server.JOBS.clear()
+        patch_draw_db(self)
         self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -1456,6 +1495,7 @@ class MusicHttpTest(unittest.TestCase):
 class MemoryClearHttpTest(unittest.TestCase):
     def setUp(self):
         draw_server.JOBS.clear()
+        patch_draw_db(self)
         self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -1511,7 +1551,9 @@ class MemoryClearHttpTest(unittest.TestCase):
 
 
 class LoginFlowTest(unittest.TestCase):
+    """Registration, approval page and per-user login over real HTTP."""
     def setUp(self):
+        patch_draw_db(self)
         self.server = draw_server.ThreadingHTTPServer(("127.0.0.1", 0), draw_server.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -1529,12 +1571,84 @@ class LoginFlowTest(unittest.TestCase):
             {"Content-Type": "application/json", **(headers or {})}, method="POST")
         return urllib.request.urlopen(request, timeout=5)
 
-    def test_login_rejects_wrong_password(self):
+    def register(self, **overrides):
+        body = {"fullname": "สมชาย ใจดี", "username": "somchai", "password": "secret1"}
+        body.update(overrides)
+        return self.post_json("/api/register", body)
+
+    def test_register_rejects_missing_fields_and_duplicates(self):
+        for body in [{"fullname": "", "username": "a1", "password": "x"},
+                     {"fullname": "คน", "username": "", "password": "x"},
+                     {"fullname": "คน", "username": "a1", "password": ""},
+                     {"fullname": "คน", "username": "bad name!", "password": "x"},
+                     {"fullname": "คน", "username": "A1", "password": "x"}]:
+            with self.subTest(body=body), \
+                    self.assertRaises(urllib.error.HTTPError) as error:
+                self.register(**body)
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+        with self.register() as response:
+            data = json.load(response)
+        self.assertTrue(data["ok"])
         with self.assertRaises(urllib.error.HTTPError) as error:
-            self.post_json("/api/login", {"password": "not-the-password"})
+            self.register(username="somchai")
+        self.assertEqual(error.exception.code, 400)
+        error.exception.close()
+
+    def test_pending_account_cannot_log_in_until_approved(self):
+        with self.register():
+            pass
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post_json("/api/login", {"username": "somchai", "password": "secret1"})
+        self.assertEqual(error.exception.code, 403)
+        error.exception.close()
+        with post_json(self.base, "/api/approve/login",
+                       {"code": draw_server.APPROVE_CODE}) as response:
+            admin = json.load(response)["token"]
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post_json("/api/admin/approve", {"username": "somchai"})
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+        with self.post_json("/api/admin/approve", {"username": "somchai"},
+                            {"Authorization": "Bearer " + admin}) as response:
+            self.assertTrue(json.load(response)["ok"])
+        with self.post_json("/api/login", {"username": "somchai",
+                                           "password": "secret1"}) as response:
+            data = json.load(response)
+        self.assertTrue(data["token"])
+        self.assertEqual(data["username"], "somchai")
+        auth = {"Authorization": "Bearer " + data["token"]}
+        request = urllib.request.Request(self.base + "/api/session", headers=auth)
+        with urllib.request.urlopen(request) as response:
+            session = json.load(response)
+        self.assertEqual(session["username"], "somchai")
+        self.assertEqual(session["fullname"], "สมชาย ใจดี")
+
+    def test_wrong_password_rejected_without_session(self):
+        with self.register():
+            pass
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post_json("/api/login", {"username": "somchai", "password": "wrong"})
         self.assertEqual(error.exception.code, 401)
         error.exception.close()
         self.assertFalse(draw_server.SESSIONS)
+
+    def test_admin_code_gates_the_approve_page(self):
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post_json("/api/approve/login", {"code": "not-the-code"})
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+        self.assertFalse(draw_server.SESSIONS)
+        with self.register():
+            pass
+        with post_json(self.base, "/api/approve/login",
+                       {"code": draw_server.APPROVE_CODE}) as response:
+            admin = json.load(response)["token"]
+        request = urllib.request.Request(self.base + "/api/admin/pending",
+                                         headers={"Authorization": "Bearer " + admin})
+        with urllib.request.urlopen(request) as response:
+            pending = json.load(response)["pending"]
+        self.assertEqual([u["username"] for u in pending], ["somchai"])
 
     def test_api_locked_without_token_and_opened_by_login(self):
         with self.assertRaises(urllib.error.HTTPError) as error:
@@ -1542,10 +1656,9 @@ class LoginFlowTest(unittest.TestCase):
         self.assertEqual(error.exception.code, 401)
         error.exception.close()
 
-        with self.post_json("/api/login", {"password": draw_server.DRAW_PASSWORD}) as response:
-            data = json.load(response)
-        self.assertTrue(data["token"])
-        auth = {"Authorization": "Bearer " + data["token"]}
+        token = approve_user_via_api(self.base, "somchai", "secret1")
+        self.assertTrue(token)
+        auth = {"Authorization": "Bearer " + token}
 
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.post_json("/api/generate", {"prompt": "bird"})
