@@ -13,6 +13,7 @@ import hmac
 import html
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -28,6 +29,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
+from collections import Counter
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -117,6 +119,18 @@ QUEUE_EVENT_INTERVAL = float(os.environ.get("QUEUE_EVENT_INTERVAL", "3"))
 # Image/music jobs unload the chat model before sampling; give an in-flight
 # answer this many seconds to finish first so it is not cut off mid-stream.
 CHAT_GRACE_SECONDS = float(os.environ.get("CHAT_GRACE_SECONDS", "90"))
+# Per-user RAG knowledge base: uploaded files are extracted, chunked and kept
+# in SQLite; retrieval scores chunks against the question (trigram TF-IDF
+# cosine — a small in-database vector store, no embedding server needed).
+RAG_CHUNK_CHARS = int(os.environ.get("RAG_CHUNK_CHARS", "900"))
+RAG_CHUNK_OVERLAP = 150
+RAG_TOPK = int(os.environ.get("RAG_TOPK", "6"))
+RAG_MAX_CONTEXT = int(os.environ.get("RAG_MAX_CONTEXT", "4000"))
+RAG_MAX_CHUNKS_PER_DOC = 400
+RAG_MAX_IMAGES = 3
+DOC_IMAGE_MAX = 15 * 1024 * 1024
+DOC_TEXT_EXTS = {"txt", "md", "csv", "json", "py", "log", "xml", "html"}
+DOC_IMAGE_EXTS = {"png", "jpg", "jpeg"}
 MAX_BODY = 12 * 1024 * 1024  # allows a base64 reference image
 MAX_REFERENCE = 10 * 1024 * 1024
 # Qwen-Image-2.1 is distilled. The ComfyUI template samples euler/simple at
@@ -205,6 +219,23 @@ CREATE TABLE IF NOT EXISTS media(
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_media_user ON media(user_id, kind);
+CREATE TABLE IF NOT EXISTS documents(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  rel_path TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  chunks INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
+CREATE TABLE IF NOT EXISTS doc_chunks(
+  doc_id INTEGER NOT NULL,
+  idx INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  PRIMARY KEY(doc_id, idx)
+);
 """
 
 
@@ -344,12 +375,14 @@ def session_valid(token):
 
 
 def used_bytes(user_id):
-    """Storage the user's library takes: media files plus chat text."""
+    """Storage the user's library takes: media, knowledge docs and chat text."""
     with db() as conn:
         row = conn.execute(
             "SELECT (SELECT COALESCE(SUM(bytes),0) FROM media WHERE user_id=?)"
+            " + (SELECT COALESCE(SUM(bytes),0) FROM documents WHERE user_id=?)"
             " + (SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))),0)"
-            "    FROM chat_messages WHERE user_id=?) AS used", (user_id, user_id)).fetchone()
+            "    FROM chat_messages WHERE user_id=?) AS used",
+            (user_id, user_id, user_id)).fetchone()
     return int(row["used"])
 
 
@@ -361,13 +394,17 @@ def storage_summary(user_id):
             " COUNT(CASE WHEN kind='image' THEN 1 END) AS image_count,"
             " COUNT(CASE WHEN kind='music' THEN 1 END) AS music_count"
             " FROM media WHERE user_id=?", (user_id,)).fetchone()
+        docs = conn.execute(
+            "SELECT COALESCE(SUM(bytes),0) AS bytes, COUNT(*) AS count"
+            " FROM documents WHERE user_id=?", (user_id,)).fetchone()
         chat = conn.execute(
             "SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))),0) AS bytes,"
             " COUNT(*) AS messages FROM chat_messages WHERE user_id=?",
             (user_id,)).fetchone()
-    used = int(row["images"]) + int(row["music"]) + int(chat["bytes"])
+    used = int(row["images"]) + int(row["music"]) + int(docs["bytes"]) + int(chat["bytes"])
     return {"quota": USER_QUOTA, "used": used, "remaining": max(0, USER_QUOTA - used),
             "images_bytes": int(row["images"]), "music_bytes": int(row["music"]),
+            "docs_bytes": int(docs["bytes"]), "doc_count": int(docs["count"]),
             "chats_bytes": int(chat["bytes"]),
             "image_count": int(row["image_count"]), "music_count": int(row["music_count"]),
             "chat_messages": int(chat["messages"])}
@@ -440,7 +477,7 @@ def archive_job_output(user, kind, source_path, note):
             " VALUES(?,?,?,?,?,?,?,?)",
             (media_id, user_id, kind, filename,
              f"{username}/{sub}/{filename}", dest.stat().st_size,
-             (note or "").strip()[:200], time.time()))
+             (note or "").strip()[:8000], time.time()))
     return media_id
 
 
@@ -462,6 +499,202 @@ def delete_media(user_id, media_id=None, kind=None):
         except OSError:
             pass
     return len(rows)
+
+
+def extract_knowledge(name, data):
+    """Classify and read an uploaded knowledge file -> (kind, text, error)."""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    try:
+        if ext in DOC_IMAGE_EXTS:
+            return "image", None, None
+        if ext in DOC_TEXT_EXTS:
+            return "text", data.decode("utf-8", "replace")[:200000], None
+        if ext == "docx":
+            return "text", extract_docx(data)[:200000], None
+        if ext in ("xlsx", "xlsm"):
+            text = extract_xlsx(data)
+            if not text.strip():
+                return None, None, "ไม่พบตารางที่อ่านได้ในไฟล์ Excel นี้"
+            return "text", text[:200000], None
+        if ext == "pptx":
+            return "text", extract_pptx(data)[:200000], None
+        if ext == "pdf":
+            text = pdf_text_via_poppler(data)  # proper Thai text when present
+            if len(text.strip()) < 20:
+                text = extract_pdf(data)
+            if len(text.strip()) < 20:
+                return None, None, "อ่านข้อความจาก PDF นี้ไม่ได้ ลองแนบเป็น .docx หรือ .txt แทน"
+            return "text", _rescue_mojibake(text)[:200000], None
+    except Exception:
+        return None, None, "เปิดไฟล์ไม่สำเร็จ"
+    return None, None, "ชนิดไฟล์นี้ยังไม่รองรับ (รับ .docx .pdf .txt .xlsx .pptx .png .jpg)"
+
+
+def chunk_text(text, size=RAG_CHUNK_CHARS, overlap=RAG_CHUNK_OVERLAP):
+    """Split extracted text into overlapping chunks, preferring line breaks."""
+    text = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+    if not text:
+        return []
+    chunks, start = [], 0
+    while start < len(text) and len(chunks) < RAG_MAX_CHUNKS_PER_DOC:
+        end = min(len(text), start + size)
+        if end < len(text):
+            cut = text.rfind("\n", start + size // 2, end)
+            if cut > start:
+                end = cut
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
+def add_knowledge_doc(user, name, data):
+    """Store one knowledge file (original bytes + text chunks) under quota.
+
+    Returns (doc_id, chunk_count); raises ValueError with a Thai message.
+    """
+    user_id, username = user
+    name = (name or "file").strip()[:200] or "file"
+    kind, text, err = extract_knowledge(name, data)
+    if err:
+        raise ValueError(f"{name}: {err}")
+    limit = DOC_IMAGE_MAX if kind == "image" else CHAT_MAX_FILE
+    if len(data) > limit:
+        raise ValueError(f"{name}: ใหญ่เกิน {limit // 1024 // 1024}MB")
+    if used_bytes(user_id) + len(data) > USER_QUOTA:
+        raise ValueError("พื้นที่จัดเก็บเต็มแล้ว — ลบไฟล์เก่าก่อนแล้วอัปโหลดใหม่")
+    chunks = chunk_text(text) if kind == "text" else []
+    if kind == "text" and not chunks:
+        raise ValueError(f"{name}: ไม่พบข้อความที่อ่านได้")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:90] or "file"
+    dest_dir = USERS_DIR / username / "docs"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    stem, dot, ext = safe.rpartition(".")
+    base, n = safe, 2
+    while (dest_dir / base).exists():
+        base = f"{stem}-{n}.{ext}" if dot else f"{safe}-{n}"
+        n += 1
+    (dest_dir / base).write_bytes(data)
+    with DB_LOCK, db() as conn:
+        cur = conn.execute(
+            "INSERT INTO documents(user_id, name, kind, rel_path, bytes, chunks, created_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (user_id, name, kind, f"{username}/docs/{base}", len(data),
+             len(chunks), time.time()))
+        doc_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO doc_chunks(doc_id, idx, text) VALUES(?,?,?)",
+            [(doc_id, i, c) for i, c in enumerate(chunks)])
+    return doc_id, len(chunks)
+
+
+def list_documents(user_id):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, kind, bytes, chunks, created_at FROM documents"
+            " WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
+    return {"documents": [
+        {"id": r["id"], "name": r["name"], "kind": r["kind"],
+         "bytes": int(r["bytes"]), "chunks": int(r["chunks"]),
+         "created_at": r["created_at"]} for r in rows]}
+
+
+def delete_document(user_id, doc_id=None):
+    with DB_LOCK, db() as conn:
+        if doc_id is None:
+            rows = conn.execute("SELECT * FROM documents WHERE user_id=?",
+                                (user_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM documents WHERE user_id=? AND id=?",
+                                (user_id, doc_id)).fetchall()
+        for row in rows:
+            conn.execute("DELETE FROM documents WHERE id=?", (row["id"],))
+            conn.execute("DELETE FROM doc_chunks WHERE doc_id=?", (row["id"],))
+    for row in rows:
+        target = DATA_DIR / "users" / row["rel_path"]
+        try:
+            target.unlink()
+        except OSError:
+            pass
+    return len(rows)
+
+
+def _trigrams(text):
+    """Language-agnostic tokens: character trigrams over the de-spaced text
+    work for both Thai (no spaces) and English."""
+    text = re.sub(r"\s+", "", (text or "").lower())
+    return [text[i:i + 3] for i in range(max(0, len(text) - 2))]
+
+
+def rag_retrieve(user_id, query, topk=RAG_TOPK, max_chars=RAG_MAX_CONTEXT):
+    """Vector-style retrieval over the user's knowledge chunks.
+
+    Each chunk and the query become trigram-count vectors weighted by IDF;
+    cosine similarity picks the most relevant slices. Per-user corpora are
+    tiny, so this scan is instant and needs no embedding server.
+    -> [(doc_name, chunk_text), ...]
+    """
+    qgrams = Counter(_trigrams(query))
+    if not qgrams:
+        return []
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT d.name, c.text FROM doc_chunks c"
+            " JOIN documents d ON d.id = c.doc_id"
+            " WHERE d.user_id=? AND d.kind='text'", (user_id,)).fetchall()
+    if not rows:
+        return []
+    doc_counts = [Counter(_trigrams(r["text"])) for r in rows]
+    df = Counter()
+    for counts in doc_counts:
+        df.update(counts.keys())
+    n_docs = len(rows) + 1
+
+    def weight(gram):
+        return math.log(1.0 + n_docs / df[gram])
+
+    def vec(counts):
+        # grams absent from every chunk can never match; drop them so the
+        # query vector lives in the same dimensions as the chunks
+        return {g: c * weight(g) for g, c in counts.items() if df[g]}
+
+    def norm(v):
+        return math.sqrt(sum(x * x for x in v.values())) or 1.0
+
+    qvec = vec(qgrams)
+    qnorm = norm(qvec)
+    scored = []
+    for r, counts in zip(rows, doc_counts):
+        dvec = vec(counts)
+        dot = sum(qvec[g] * dvec[g] for g in qgrams if g in dvec)
+        scored.append((dot / (qnorm * norm(dvec)), r["name"], r["text"]))
+    scored.sort(key=lambda s: s[0], reverse=True)
+    out, total = [], 0
+    for score, name, text in scored:
+        if score <= 0 or len(out) >= topk or total >= max_chars:
+            break
+        out.append((name, text))
+        total += len(text)
+    return out
+
+
+def rag_knowledge_images(user_id, limit=RAG_MAX_IMAGES):
+    """Newest knowledge images, base64-encoded for the vision model."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT rel_path FROM documents WHERE user_id=? AND kind='image'"
+            " ORDER BY created_at DESC LIMIT ?", (user_id, limit)).fetchall()
+    images = []
+    for r in rows:
+        path = USERS_DIR / r["rel_path"]
+        try:
+            images.append(base64.b64encode(path.read_bytes()).decode())
+        except OSError:
+            continue
+    return images
 
 
 def chat_title(text):
@@ -949,6 +1182,22 @@ def extract_xlsx(data):
     if out:
         return "\n\n".join(out)
     return "\n".join(s for s in shared if s)
+
+
+def extract_pptx(data):
+    """Speaker text from a PowerPoint file: one block per slide (zip of XML)."""
+    out = []
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        slides = sorted((n for n in z.namelist()
+                         if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                        key=lambda n: int(re.search(r"(\d+)", n).group(1)))
+        for i, name in enumerate(slides, 1):
+            xml = z.read(name).decode("utf-8", "replace")
+            xml = re.sub(r"</a:p>", "\n", xml)
+            text = _xml_text(xml).strip()
+            if text:
+                out.append(f"=== สไลด์ {i} ===\n{text}")
+    return "\n\n".join(out)
 
 
 def extract_pdf(data):
@@ -1878,6 +2127,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(403, {"error": "บัญชีนี้ใช้งานห้องแชตเท่านั้น"})
                 return
             self._send(200, user_library(user["id"]))
+        elif route == "/api/docs":
+            user = self._current_user()
+            if not user:
+                self._send(403, {"error": "บัญชีนี้ใช้งานห้องแชตเท่านั้น"})
+                return
+            self._send(200, list_documents(user["id"]))
+        elif route.startswith("/api/docs/") and route.endswith("/file"):
+            user = self._current_user()
+            did = route[len("/api/docs/"):-len("/file")]
+            with db() as conn:
+                row = conn.execute("SELECT * FROM documents WHERE id=? AND user_id=?",
+                                   (did, user["id"] if user else -1)).fetchone()
+            if not row or not str(did).isdigit() or row["id"] != int(did):
+                self._send(404, {"error": "ไม่พบไฟล์นี้"})
+                return
+            target = (DATA_DIR / "users" / row["rel_path"]).resolve()
+            if not str(target).startswith(str((DATA_DIR / "users").resolve())) or not target.is_file():
+                self._send(404, {"error": "ไฟล์หายไปแล้ว"})
+                return
+            ctype = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                     "pdf": "application/pdf", "txt": "text/plain",
+                     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                     }.get(target.suffix.lower().lstrip("."), "application/octet-stream")
+            self._send(200, target.read_bytes(), ctype, cache="no-cache")
         elif route == "/api/admin/pending":
             if not self._is_admin():
                 self._send(403, {"error": "ต้องเข้าสู่ระบบหน้าอนุมัติก่อน"})
@@ -1985,6 +2260,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/memory/clear":
             self._handle_memory_clear()
+            return
+        if route == "/api/docs":
+            self._handle_docs_upload()
             return
         if route != "/api/generate":
             self._send(404, {"error": "not found"})
@@ -2139,6 +2417,37 @@ class Handler(BaseHTTPRequestHandler):
         release_ollama_vram()
         self._send(200, {"ok": True, "comfy_freed": comfy_freed})
 
+    def _handle_docs_upload(self):
+        """Add one knowledge file to the user's private RAG store."""
+        user = self._current_user()
+        if not user:
+            self._send(403, {"error": "บัญชีนี้ใช้งานห้องแชตเท่านั้น"})
+            return
+        body = self._read_json(24 * 1024 * 1024)  # base64 of a 15MB file
+        if body is None:
+            return
+        name = body.get("name")
+        data = body.get("data")
+        if not isinstance(name, str) or not name.strip():
+            self._send(400, {"error": "ไม่ได้ระบุชื่อไฟล์"})
+            return
+        if not isinstance(data, str):
+            self._send(400, {"error": "ไม่ได้แนบข้อมูลไฟล์"})
+            return
+        try:
+            raw = base64.b64decode(data, validate=False)
+        except (binascii.Error, ValueError):
+            self._send(400, {"error": "ไฟล์เสียหาย อ่านข้อมูลไม่ได้"})
+            return
+        try:
+            doc_id, chunks = add_knowledge_doc(
+                (user["id"], user["username"]), name, raw)
+        except ValueError as e:
+            self._send(400, {"error": str(e)})
+            return
+        self._send(200, {"ok": True, "id": doc_id, "chunks": chunks,
+                         "storage": storage_summary(user["id"])})
+
     def _handle_chat(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -2175,8 +2484,35 @@ class Handler(BaseHTTPRequestHandler):
         if raw_messages[-1].get("images") and not known[model_id]["vision"]:
             self._send(400, {"error": "โมเดลที่เลือกไม่รองรับรูปภาพ กรุณาเลือกโมเดลที่มีป้าย 'เห็นภาพ'"})
             return
+        question_text = str(raw_messages[-1].get("content") or "").strip()
+        user = self._current_user()
+        # History label built from what the user actually sent (before any
+        # knowledge injection, so the saved question stays human-readable).
+        attach_markers = []
+        if raw_messages[-1].get("images"):
+            attach_markers.append(f"รูป {len(raw_messages[-1]['images'])} ไฟล์")
+        if raw_messages[-1].get("docs"):
+            attach_markers.append(f"เอกสาร {len(raw_messages[-1]['docs'])} ไฟล์")
+        use_rag = bool(body.get("rag")) and bool(user)
+        rag_hits, rag_images = [], []
+        if use_rag:
+            rag_hits = rag_retrieve(user["id"], question_text)
+            if known[model_id]["vision"]:
+                rag_images = rag_knowledge_images(user["id"])
         try:
             pdf_notes = preprocess_pdf_docs(body, known[model_id]["vision"])
+            if rag_hits:
+                blocks = [f"[แหล่งความรู้ {name}]\n{text}" for name, text in rag_hits]
+                last = raw_messages[-1]
+                prefix = ("ด้านล่างนี้คือแหล่งความรู้ส่วนของผู้ใช้ ใช้ประกอบการตอบเมื่อเกี่ยวข้อง"
+                          " และระบุว่าอ้างอิงจากแหล่งใดเมื่อใช้:\n\n")
+                last["content"] = ((last["content"].rstrip() + "\n\n")
+                                   if last["content"].strip() else "") + prefix + "\n\n".join(blocks)
+            if rag_images:
+                room = max(0, CHAT_MAX_MODEL_IMAGES - len(raw_messages[-1].get("images") or []))
+                rag_images = rag_images[:room]
+                if rag_images:
+                    raw_messages[-1].setdefault("images", []).extend(rag_images)
             messages, has_images, notes = build_chat_messages(
                 body, image_limit=CHAT_MAX_MODEL_IMAGES)
         except ValueError as e:
@@ -2186,20 +2522,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "โมเดลที่เลือกไม่รองรับรูปภาพ กรุณาเลือกโมเดลที่มีป้าย 'เห็นภาพ'"})
             return
         notes = pdf_notes + (notes or [])
+        if use_rag:
+            if rag_hits or rag_images:
+                parts = []
+                if rag_hits:
+                    parts.append(f"ดึงข้อความที่เกี่ยวข้องจากแหล่งความรู้ {len(rag_hits)} ช่วง")
+                if rag_images:
+                    parts.append(f"แนบรูปจากแหล่งความรู้ {len(rag_images)} รูปให้โมเดลมอง")
+                notes.append("📚 " + " และ ".join(parts))
+            elif not list_documents(user["id"])["documents"]:
+                notes.append("📚 ยังไม่ได้อัปโหลดแหล่งความรู้ — อัปโหลดได้ในแท็บ จัดการเนื้อหา")
+            else:
+                notes.append("📚 ไม่พบข้อความในแหล่งความรู้ที่เกี่ยวข้องกับคำถามนี้ จึงตอบจากความรู้ทั่วไป")
         # Auto-archive: keep the question (plus a note about attachments) and,
         # once the stream completes, the answer in the user's history.
         persist = None
-        user = self._current_user()
         if user:
-            last = raw_messages[-1] if raw_messages else {}
-            user_text = str(last.get("content") or "").strip()
-            markers = []
-            if last.get("images"):
-                markers.append(f"รูป {len(last['images'])} ไฟล์")
-            if last.get("docs"):
-                markers.append(f"เอกสาร {len(last['docs'])} ไฟล์")
+            user_text = question_text
+            markers = list(attach_markers)
+            if use_rag:
+                markers.append("ใช้แหล่งความรู้")
             if markers:
-                user_text = (user_text + "\n" if user_text else "") + "[แนบ: " + ", ".join(markers) + "]"
+                user_text = (user_text + "\n" if user_text else "") + \
+                    "[" + ", ".join(markers) + "]"
             session_id = body.get("chat_session")
             persist = {"user_id": user["id"],
                        "session": session_id if isinstance(session_id, str) else None,
@@ -2283,6 +2628,14 @@ class Handler(BaseHTTPRequestHandler):
         elif route.startswith("/api/media/"):
             mid = route.rsplit("/", 1)[-1]
             if not delete_media(user["id"], media_id=mid):
+                self._send(404, {"error": "ไม่พบไฟล์นี้"})
+                return
+            self._send(200, {"removed": 1})
+        elif route == "/api/docs":
+            self._send(200, {"removed": delete_document(user["id"])})
+        elif route.startswith("/api/docs/"):
+            did = route.rsplit("/", 1)[-1]
+            if not did.isdigit() or not delete_document(user["id"], int(did)):
                 self._send(404, {"error": "ไม่พบไฟล์นี้"})
                 return
             self._send(200, {"removed": 1})
