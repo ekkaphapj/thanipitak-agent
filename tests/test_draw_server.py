@@ -1187,6 +1187,21 @@ class LyricsHttpTest(ChatServerTest):
         sent = json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(sent["model"], "typhoon2-8b:latest")
 
+    def test_lyrics_target_seconds_reach_the_prompt(self):
+        lines = [{"message": {"content": "[Verse 1]\na"}, "done": True}]
+        with self.ollama_mock(lines) as urlopen, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True):
+            with self.post_lyrics({"model": "qwen3:8b", "genre": "pop",
+                                   "seconds": 30}) as response:
+                response.read()
+            self.assertIn("ประมาณ 30 วินาที",
+                          json.loads(urlopen.call_args.args[0].data)["messages"][-1]["content"])
+            with self.post_lyrics({"model": "qwen3:8b", "genre": "pop",
+                                   "seconds": "soon"}) as response:
+                response.read()
+            self.assertIn("ประมาณ 120 วินาที",
+                          json.loads(urlopen.call_args.args[0].data)["messages"][-1]["content"])
+
     def test_lyrics_upstream_error_is_forwarded(self):
         body = {"model": "qwen3:8b", "genre": "pop"}
         chunks = [{"message": {"content": "บางส่วน"}, "done": False},
@@ -1422,6 +1437,52 @@ class MusicGraphTest(unittest.TestCase):
             "lofi", "", 30, 7, planning=False)
         self.assertNotIn("2", graph)
         self.assertEqual(graph["3"]["inputs"]["abc"], "")
+        # docs: cfg 1.01 restores text guidance when no ABC plan is attached
+        self.assertEqual(graph["6"]["inputs"]["cfg"], 1.01)
+
+
+class MasterAudioTest(unittest.TestCase):
+    def test_missing_ffmpeg_leaves_file_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "song.mp3"
+            target.write_bytes(b"not really audio")
+            with mock.patch.object(draw_server.shutil, "which", return_value=None):
+                self.assertFalse(draw_server.master_audio(target))
+            self.assertEqual(target.read_bytes(), b"not really audio")
+
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg"),
+                         "ffmpeg not installed")
+    def test_real_file_is_normalized_to_streaming_loudness(self):
+        import shutil
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "song.mp3"
+            quiet = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i",
+                 "sine=frequency=440:duration=2", "-af", "volume=0.04",
+                 "-c:a", "libmp3lame", "-q:a", "5", str(target)],
+                capture_output=True, text=True)
+            self.assertEqual(quiet.returncode, 0, quiet.stderr)
+            self.assertTrue(draw_server.master_audio(target))
+            self.assertTrue(target.stat().st_size > 0)
+            measured = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats", "-i", str(target),
+                 "-af", "loudnorm=I=-14:print_format=json", "-f", "null", "-"],
+                capture_output=True, text=True)
+            blob = measured.stderr[measured.stderr.rfind("{"):]
+            stats = json.loads(blob[:blob.rfind("}") + 1])
+            self.assertLess(abs(float(stats["input_i"]) + 14), 2)
+
+
+class LyricsPromptTest(unittest.TestCase):
+    def test_system_prompt_pins_style_and_singability_rules(self):
+        prompt = draw_server.LYRICS_SYSTEM
+        for needle in ("[Style]", "[Verse 1]", "[Chorus]",
+                       "เพศและน้ำเสียงร้อง", "บรรยากาศโปรดักชัน",
+                       "6 ตัวอักษรต่อวินาที",
+                       "6-10 พยางค์", "ห้ามใช้บรรทัดเดิมซ้ำมากกว่า 2 ครั้ง",
+                       "ฮุคที่ติดหูที่สุดของเพลงต้องอยู่ในท่อน [Chorus]"):
+            self.assertIn(needle, prompt)
 
 
 class MusicHttpTest(unittest.TestCase):
@@ -1483,6 +1544,22 @@ class MusicHttpTest(unittest.TestCase):
                 error.exception.close()
         run_music.assert_not_called()
         self.assertFalse(draw_server.JOBS)
+
+    def test_overlong_lyrics_are_rejected_but_tags_do_not_count(self):
+        with mock.patch.object(draw_server, "run_music_job") as run_music:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.post_music({"style": "pop", "seconds": 30,
+                                 "lyrics": "[Verse]\n" + "ก" * 250})
+            self.assertEqual(error.exception.code, 400)
+            self.assertIn("ตัดจบกลางคัน",
+                          json.loads(error.exception.read().decode())["error"])
+            error.exception.close()
+            run_music.assert_not_called()
+            self.assertFalse(draw_server.JOBS)
+            # section tags and whitespace are free; only sung characters count
+            with self.post_music({"style": "pop", "seconds": 15,
+                                  "lyrics": "[Verse 1]\nสวัสดี\n\n[Chorus]\nสวัสดี"}) as response:
+                self.assertTrue(json.load(response)["id"])
 
         self.music_on.stop()
         with mock.patch.object(draw_server, "music_available", return_value=False):

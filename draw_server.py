@@ -109,6 +109,11 @@ JOB_TIMEOUT = 900  # seconds
 YUE2_CHECKPOINT = os.environ.get("YUE2_CHECKPOINT", "yue2_3b_int8_convrot.safetensors")
 MUSIC_JOB_TIMEOUT = 3600  # seconds
 MUSIC_MAX_SECONDS = 240
+# YuE2 budgets roughly 25 semantic tokens per second of song; lyrics longer
+# than the requested window cannot be sung in time and the audio gets cut off
+# mid-song (the "token budget before end token" console warning). Thai text
+# sings at about 6-9 chars/second, so cap the singable characters here.
+MUSIC_CHARS_PER_SEC = 7
 # One GPU, many users: each lane caps how many jobs run at once and the rest
 # wait in a FIFO with live queue positions. Chat (Ollama) and ComfyUI jobs
 # queue separately so simultaneous users never thrash the 12GB card.
@@ -857,15 +862,22 @@ QUOTED_RE = re.compile(r'"([^"\n]+)"')
 LYRICS_SYSTEM = (
     "คุณเป็นนักแต่งเนื้อร้องมืออาชีพ ช่วยเขียนเนื้อร้องภาษาไทยสำหรับโมเดลสร้างเพลง YuE2 "
     "ตอบเป็นสองส่วนตามลำดับนี้เท่านั้น ห้ามอธิบายอื่นใด ห้ามใช้ markdown "
-    "ส่วนแรก: บรรทัดแรกเขียนว่า [Style] แล้วบรรทัดถัดมาเขียนสไตล์เพลงภาษาอังกฤษบรรทัดเดียว "
-    "ที่เหมาะกับเพลงนี้ที่สุด ระบุภาษา แนวเพลง เสียงร้อง จังหวะ BPM อารมณ์ และเครื่องดนตรี "
-    "ตัวอย่างรูปแบบ: Thai, upbeat acoustic pop, warm female vocal, 96 BPM, heartfelt, "
-    "acoustic guitar and soft piano "
+    "ส่วนแรก: บรรทัดแรกเขียนว่า [Style] แล้วบรรทัดถัดมาเขียนสไตล์เพลงภาษาอังกฤษ 1-2 ประโยค "
+    "ระบุให้ครบทุกอย่าง: ภาษา แนวเพลง เพศและน้ำเสียงร้อง จังหวะ BPM อารมณ์ "
+    "เครื่องดนตรีหลัก และบรรยากาศโปรดักชัน "
+    "ตัวอย่างรูปแบบ: Thai, upbeat acoustic pop, warm female vocal with clear diction, "
+    "96 BPM, heartfelt and hopeful, strummed acoustic guitar, soft piano and light drums, "
+    "warm intimate mix "
     "ส่วนที่สอง: เนื้อร้องภาษาไทย จัดทุกท่อนด้วยแท็กวงเล็บเหลี่ยมบนบรรทัดของตัวเองในรูปแบบ "
     "[Verse 1], [Chorus], [Verse 2], [Bridge], [Outro] "
     "ต้องเริ่มด้วย [Verse 1] และมีท่อน [Chorus] อย่างน้อยหนึ่งท่อน "
-    "แต่ละท่อนมี 4-8 บรรทัด รวมความยาวพอเหมาะกับเพลง 1-2 นาที "
-    "เขียนให้ร้องได้จริง มีคำสัมผัส จำง่าย และเข้ากับสไตล์ที่เลือก"
+    "แต่ละท่อนมี 4-8 บรรทัด ความยาวรวมทั้งเพลงต้องพอดีกับความยาวเป้าหมายที่ระบุในคำขอ "
+    "(ทำนองร้องได้ประมาณ 6 ตัวอักษรต่อวินาที — เนื้อร้องยาวเกินนั้นเพลงจะถูกตัดจบกลางคัน "
+    "เพลงสั้นให้ลดจำนวนท่อน เพลงยาวจึงเพิ่มท่อนได้) "
+    "เขียนให้ร้องง่ายที่สุด: บรรทัดละประมาณ 6-10 พยางค์ ใช้คำสั้น ไพเราะ สระท้ายคำชัดเจน "
+    "มีคำสัมผัส จำง่าย และฮุคที่ติดหูที่สุดของเพลงต้องอยู่ในท่อน [Chorus] "
+    "ห้ามใช้บรรทัดเดิมซ้ำมากกว่า 2 ครั้งในทั้งเพลง เพราะโมเดลร้องประโยคซ้ำมาก ๆ แล้ว "
+    "คุณภาพเสียงจะเสื่อมลง"
 )
 
 
@@ -1626,6 +1638,55 @@ def music_available():
     return (MODEL_ROOT / "checkpoints" / YUE2_CHECKPOINT).exists()
 
 
+def singable_chars(lyrics):
+    """Characters the model actually has to sing: section tags and whitespace
+    stripped, so [Verse]/[Chorus] markers and blank lines don't eat the budget."""
+    return len(re.sub(r"\[[^\]\n]{1,24}\]|\s+", "", lyrics))
+
+
+# Post-generation mastering through the ffmpeg binary (stdlib only on the
+# Python side). Two-pass loudnorm applies a clean linear gain to a streaming-
+# friendly -14 LUFS with true-peak limiting; a gentle compressor ahead of it
+# evens out quiet passages. Best-effort: when ffmpeg is missing or anything
+# fails, the original ComfyUI file is served untouched.
+MASTER_PRE_COMP = "acompressor=threshold=-18dB:ratio=2:attack=20:release=250"
+MASTER_LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"
+
+
+def master_audio(path):
+    """EBU R128-normalize the finished song in place; True when rewritten."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not path.exists():
+        return False
+    tmp = path.with_name(path.stem + ".mastered" + path.suffix)
+    try:
+        measure = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", str(path),
+             "-af", f"{MASTER_PRE_COMP},{MASTER_LOUDNORM}:print_format=json",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=180)
+        blob = measure.stderr[measure.stderr.rfind("{"):]
+        stats = json.loads(blob[:blob.rfind("}") + 1])
+        chain = (f"{MASTER_PRE_COMP},{MASTER_LOUDNORM}"
+                 f":measured_I={stats['input_i']}:measured_TP={stats['input_tp']}"
+                 f":measured_LRA={stats['input_lra']}"
+                 f":measured_thresh={stats['input_thresh']}"
+                 f":offset={stats['target_offset']}:linear=true")
+        encode = subprocess.run(
+            [ffmpeg, "-hide_banner", "-y", "-i", str(path), "-af", chain,
+             "-c:a", "libmp3lame", "-q:a", "0", "-ar", "44100", str(tmp)],
+            capture_output=True, text=True, timeout=180)
+        # -ar is mandatory: loudnorm's internal 192kHz would leak into the MP3
+        if encode.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            return False
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op once os.replace consumed it
+
+
 def build_yue2_graph(style, lyrics, seconds, seed, planning=True):
     """Text-to-song graph mirroring the ComfyUI 'Text to Music (YuE2)' template."""
     graph = {
@@ -1642,7 +1703,10 @@ def build_yue2_graph(style, lyrics, seconds, seed, planning=True):
             "seconds": ["3", 1], "batch_size": 1}},
         "6": {"class_type": "KSampler", "inputs": {
             "model": ["1", 0], "positive": ["3", 0], "negative": ["4", 0],
-            "latent_image": ["5", 0], "seed": seed, "steps": 32, "cfg": 1.0,
+            "latent_image": ["5", 0], "seed": seed, "steps": 32,
+            # ComfyUI docs: cfg 1.0 pairs with the ABC plan, 1.01 restores
+            # text guidance when planning is off.
+            "cfg": 1.0 if planning else 1.01,
             "sampler_name": "dpm_2", "scheduler": "sgm_uniform", "denoise": 1.0}},
         "7": {"class_type": "VAEDecodeAudio", "inputs": {
             "samples": ["6", 0], "vae": ["1", 2]}},
@@ -1710,17 +1774,21 @@ def run_music_job(job_id, spec, user=None):
                     for audio in output.get("audio", output.get("images", [])):
                         if audio.get("type") == "output":
                             subfolder = audio.get("subfolder", "")
+                            source = (OUTPUT_DIR / subfolder / audio["filename"]) \
+                                if subfolder else (OUTPUT_DIR / audio["filename"])
+                            # master before anyone can fetch the file
+                            mastered = master_audio(source)
                             with LOCK:
                                 JOBS[job_id]["file"] = audio["filename"]
                                 JOBS[job_id]["subfolder"] = subfolder
                                 JOBS[job_id]["status"] = "done"
                                 JOBS[job_id]["finished"] = time.time()
                             if user:
-                                source = (OUTPUT_DIR / subfolder / audio["filename"]) \
-                                    if subfolder else (OUTPUT_DIR / audio["filename"])
                                 note = "สไตล์: " + spec["style"]
                                 if spec.get("lyrics"):
                                     note += "\nเนื้อร้อง: " + spec["lyrics"]
+                                if mastered:
+                                    note += "\nปรับระดับเสียง: EBU R128 (-14 LUFS)"
                                 media_id = archive_job_output(user, "music", source, note)
                                 with LOCK:
                                     if media_id:
@@ -2385,6 +2453,15 @@ class Handler(BaseHTTPRequestHandler):
         if not 15 <= seconds <= MUSIC_MAX_SECONDS:
             self._send(400, {"error": f"ความยาวต้องอยู่ระหว่าง 15-{MUSIC_MAX_SECONDS} วินาที"})
             return
+        if lyrics:
+            chars = singable_chars(lyrics)
+            limit = seconds * MUSIC_CHARS_PER_SEC
+            if chars > limit:
+                self._send(400, {"error": (
+                    f"เนื้อร้องยาว {chars} ตัวอักษร ร้องไม่ทันใน {seconds} วินาที "
+                    f"(พอดีประมาณ {limit} ตัวอักษร) — ลดท่อน หรือเพิ่มความยาวเพลง "
+                    "ไม่งั้นเพลงจะถูกตัดจบกลางคัน")})
+                return
         planning = body.get("planning", True) is not False
         job_id = uuid.uuid4().hex[:12]
         owner = self._job_owner()
@@ -2590,9 +2667,16 @@ class Handler(BaseHTTPRequestHandler):
         if len(topic) > 400:
             self._send(400, {"error": "หัวข้อยาวเกิน 400 ตัวอักษร"})
             return
+        # Tell the lyricist how long the song will be so the lyrics fit the
+        # requested window instead of overflowing into a cut-off ending.
+        seconds = body.get("seconds")
+        if not isinstance(seconds, int) or isinstance(seconds, bool):
+            seconds = 120
+        seconds = min(max(seconds, 15), MUSIC_MAX_SECONDS)
         user_content = "แนวเพลง: " + genre
         if topic:
             user_content += "\nหัวข้อ/ธีมของเพลง: " + topic
+        user_content += f"\nความยาวเพลงเป้าหมาย: ประมาณ {seconds} วินาที"
         user_content += "\nเขียนเนื้อร้องตามรูปแบบที่กำหนดไว้"
         self._stream_chat(model_id, [
             {"role": "system", "content": LYRICS_SYSTEM},

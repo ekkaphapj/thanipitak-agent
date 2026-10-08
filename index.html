@@ -398,17 +398,27 @@ a.link-btn{text-decoration:none}
           <button class="chip chip-mini" type="button" id="music-style-clear" title="ล้างสไตล์และยกเลิกปุ่มที่เลือก">ล้าง</button>
         </div>
         <textarea id="music-style" required maxlength="800" style="min-height:110px" placeholder="เช่น English, warm female vocal, acoustic pop, 92 BPM, acoustic guitar, soft piano"></textarea>
-        <p class="hint">เลือกแนวเพลง เสียงร้อง และจังหวะจากปุ่ม — ระบบจะประกอบเป็นสไตล์ให้อัตโนมัติ แก้ข้อความเองเพิ่มได้</p>
+        <p class="hint">เลือกแนวเพลง เสียงร้อง น้ำเสียง และจังหวะจากปุ่ม — ระบบจะประกอบเป็นสไตล์ให้อัตโนมัติ ยิ่งเติมรายละเอียดเครื่องดนตรี/โปรดักชันเอง เพลงจะยิ่งตรงใจ</p>
         <div class="chip-row" role="group" aria-label="แนวเพลง"><span class="chip-label">แนวเพลง</span><div class="chips">
           <button class="chip" type="button" data-genre="Thai, marching band anthem, powerful brass section, rolling snare drums, uplifting and motivational, school spirit">เพลงมาร์ช/ปลุกใจ</button>
           <button class="chip" type="button" data-genre="Thai, cheerful upbeat pop, bright synths, bouncy bassline, catchy hooks, feel-good energy">เพลง Pop สนุกๆ</button>
           <button class="chip" type="button" data-genre="Thai, hard-hitting rock, powerful electric guitars, driving heavy drums, raw energy, guitar solo">เพลงร็อค</button>
           <button class="chip" type="button" data-genre="Thai, phuea chiwit folk rock, acoustic guitar, heartfelt storytelling, warm down-to-earth feeling">เพลงเพื่อชีวิต</button>
+          <button class="chip" type="button" data-genre="Thai, emotional pop ballad, grand piano and warm strings, gentle brushed drums, tender and moving, cinematic build-up">บัลลาดซึ้งๆ</button>
+          <button class="chip" type="button" data-genre="Thai luk thung country folk, phin lead guitar, accordion and brass, rolling dance rhythm, earthy playful charm">ลูกทุ่ง</button>
+          <button class="chip" type="button" data-genre="Thai, smooth slow R&B, silky vocal runs, mellow electric piano, deep rounded bass, soft drums, late-night romantic mood">R&B ช้าๆ</button>
+          <button class="chip" type="button" data-genre="lo-fi hip hop instrumental, mellow jazzy chords, dusty vinyl texture, laid-back boom bap drums, chill and nostalgic, no vocals">โลฟายชิลๆ (เครื่องดนตรี)</button>
         </div></div>
         <div class="chip-row" role="group" aria-label="เสียงร้อง"><span class="chip-label">เสียงร้อง</span><div class="chips">
           <button class="chip" type="button" data-vocal="male vocal">ผู้ชาย</button>
           <button class="chip" type="button" data-vocal="female vocal">ผู้หญิง</button>
           <button class="chip" type="button" data-vocal="male and female duet vocals">คู่</button>
+        </div></div>
+        <div class="chip-row" role="group" aria-label="น้ำเสียง"><span class="chip-label">น้ำเสียง</span><div class="chips">
+          <button class="chip" type="button" data-timbre="warm intimate vocal tone">อบอุ่น</button>
+          <button class="chip" type="button" data-timbre="bright clear vocal tone, clear diction">ใส</button>
+          <button class="chip" type="button" data-timbre="powerful soulful vocal delivery">ทรงพลัง</button>
+          <button class="chip" type="button" data-timbre="soft gentle vocal tone">นุ่มนวล</button>
         </div></div>
         <div class="chip-row" role="group" aria-label="จังหวะเพลง"><span class="chip-label">จังหวะเพลง</span><div class="chips">
           <button class="chip" type="button" data-tempo="slow tempo, 70 BPM">ช้า</button>
@@ -430,7 +440,7 @@ a.link-btn{text-decoration:none}
           <button class="chip chip-mini" type="button" id="music-lyrics-clear" title="ล้างเนื้อร้อง">ล้าง</button>
         </div>
         <textarea id="music-lyrics" maxlength="8000" style="min-height:110px" placeholder="[Verse]&#10;เขียนเนื้อร้องบรรทัดต่อบรรทัด&#10;&#10;[Chorus]&#10;ท่อนฮุคที่อยากให้จำ"></textarea>
-        <p class="hint">แบ่งท่อนด้วยแท็ก [Verse] [Chorus] [Bridge] [Outro] — ใส่เฉพาะถ้อยคำที่ให้ร้อง</p>
+        <p class="hint">แบ่งท่อนด้วยแท็ก [Verse] [Chorus] [Bridge] [Outro] — ใส่เฉพาะถ้อยคำที่ให้ร้อง บรรทัดละ 6-10 พยางค์ ไม่ซ้ำบรรทัดเดิมเกิน 2 ครั้ง และความยาวรวมพอดีกับเพลง (ประมาณ 7 ตัวอักษรต่อวินาที) ไม่งั้นเพลงจะถูกตัดจบกลางคัน</p>
         <label for="music-seconds" style="margin-top:16px">ความยาวสูงสุด</label>
         <select id="music-seconds">
           <option value="30">30 วินาที (เร็วที่สุด)</option>
@@ -1035,21 +1045,21 @@ $("chat-form").addEventListener("submit",async event=>{
 /* ---- music tab (YuE2 text-to-song) ---- */
 let musicBusy=false,musicStartedAt=0;
 function setMusicStatus(message,error=false){const el=$("music-status");el.textContent=message;el.style.color=error?"#ff8f88":""}
-const musicPick={genre:null,vocal:null,tempo:null};
+const musicPick={genre:null,vocal:null,timbre:null,tempo:null};
 function renderMusicPick(){
-  document.querySelectorAll("#music-page [data-genre],#music-page [data-vocal],#music-page [data-tempo]").forEach(button=>{
-    const kind=button.dataset.genre!==undefined?"genre":button.dataset.vocal!==undefined?"vocal":"tempo";
+  document.querySelectorAll("#music-page [data-genre],#music-page [data-vocal],#music-page [data-timbre],#music-page [data-tempo]").forEach(button=>{
+    const kind=button.dataset.genre!==undefined?"genre":button.dataset.vocal!==undefined?"vocal":button.dataset.timbre!==undefined?"timbre":"tempo";
     button.classList.toggle("active",musicPick[kind]===button.dataset[kind]);
   });
-  $("music-style").value=[musicPick.genre,musicPick.vocal,musicPick.tempo].filter(Boolean).join(", ");
+  $("music-style").value=[musicPick.genre,musicPick.vocal,musicPick.timbre,musicPick.tempo].filter(Boolean).join(", ");
 }
-document.querySelectorAll("#music-page [data-genre],#music-page [data-vocal],#music-page [data-tempo]").forEach(button=>button.addEventListener("click",()=>{
-  const kind=button.dataset.genre!==undefined?"genre":button.dataset.vocal!==undefined?"vocal":"tempo";
+document.querySelectorAll("#music-page [data-genre],#music-page [data-vocal],#music-page [data-timbre],#music-page [data-tempo]").forEach(button=>button.addEventListener("click",()=>{
+  const kind=button.dataset.genre!==undefined?"genre":button.dataset.vocal!==undefined?"vocal":button.dataset.timbre!==undefined?"timbre":"tempo";
   musicPick[kind]=musicPick[kind]===button.dataset[kind]?null:button.dataset[kind];
   if(kind==="genre"&&!$("music-lyrics-genre").value)$("music-lyrics-genre").value=button.textContent.trim();
   renderMusicPick();$("music-style").focus();
 }));
-$("music-style-clear").addEventListener("click",()=>{musicPick.genre=null;musicPick.vocal=null;musicPick.tempo=null;renderMusicPick();$("music-style").focus()});
+$("music-style-clear").addEventListener("click",()=>{musicPick.genre=null;musicPick.vocal=null;musicPick.timbre=null;musicPick.tempo=null;renderMusicPick();$("music-style").focus()});
 $("music-lyrics-clear").addEventListener("click",()=>{$("music-lyrics").value="";$("music-lyrics").focus()});
 let lastMusicSeed=null;
 $("music-seed-last").addEventListener("click",()=>{$("music-seed").value=lastMusicSeed;$("music-seed").focus()});
@@ -1070,6 +1080,12 @@ $("music-form").addEventListener("submit",async event=>{
   if(musicBusy||!musicReady)return;
   const style=$("music-style").value.trim();
   if(!style){setMusicStatus("กรุณาใส่สไตล์เพลง",true);$("music-style").focus();return}
+  const seconds=Number($("music-seconds").value),lyrics=$("music-lyrics").value.trim();
+  if(lyrics){ // mirror of the server guard: lyrics longer than the song get cut off mid-song
+    const singable=lyrics.replace(/\[[^\]\n]{1,24}\]/g,"").replace(/\s+/g,"").length;
+    const limit=seconds*7;
+    if(singable>limit){setMusicStatus(`เนื้อร้องยาว ${singable} ตัวอักษร ร้องไม่ทันใน ${seconds} วินาที (พอดีประมาณ ${limit} ตัวอักษร) — ลดท่อน หรือเพิ่มความยาวเพลง ไม่งั้นเพลงจะถูกตัดจบกลางคัน`,true);$("music-lyrics").focus();return}
+  }
   const rawSeed=$("music-seed").value.trim();
   if(rawSeed&&!/^\d+$/.test(rawSeed)){setMusicStatus("Seed ต้องเป็นเลขจำนวนเต็มตั้งแต่ 0 ขึ้นไป",true);$("music-seed").focus();return}
   const btn=$("music-btn");musicBusy=true;btn.disabled=true;
@@ -1078,7 +1094,7 @@ $("music-form").addEventListener("submit",async event=>{
   setMusicStatus("กำลังส่งงานเข้าคิว… การแต่งเพลงใช้เวลาหลายนาที กรุณาเปิดหน้านี้ไว้");
   setBusy("music-busy","⚙️ ระบบกำลังทำงาน — กำลังส่งงานสร้างเพลงเข้าคิว…");
   try{
-    const job=await jsonResponse(await authFetch("/api/music/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({style,lyrics:$("music-lyrics").value.trim(),seconds:Number($("music-seconds").value),planning:$("music-planning").checked,seed:rawSeed===""?undefined:Number(rawSeed)})}));
+    const job=await jsonResponse(await authFetch("/api/music/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({style,lyrics,seconds,planning:$("music-planning").checked,seed:rawSeed===""?undefined:Number(rawSeed)})}));
     if(!job.id)throw new Error("ระบบไม่ส่งหมายเลขงานกลับมา");
     if(typeof job.seed==="number"){lastMusicSeed=job.seed;const hint=$("music-seed-hint");hint.textContent="seed ล่าสุด: "+job.seed+" — จะสร้างซ้ำแบบเดิมได้ถ้าสไตล์/เนื้อร้อง/ตัวเลือกเหมือนเดิม";hint.hidden=false;$("music-seed-last").hidden=false}
     setMusicStatus("รับงานแล้ว · กำลังคืนหน่วยความจำการ์ดจอแล้วเริ่มแต่งเพลง");
@@ -1126,7 +1142,7 @@ function splitLyricsOutput(raw){
   return{style:rest.slice(0,tag).trim(),lyrics:rest.slice(tag).trim()};
 }
 function applyAiStyle(style){
-  musicPick.genre=null;musicPick.vocal=null;musicPick.tempo=null;
+  musicPick.genre=null;musicPick.vocal=null;musicPick.timbre=null;musicPick.tempo=null;
   renderMusicPick(); // drop chip-composed style, then take the AI's
   $("music-style").value=style;
 }
@@ -1146,7 +1162,7 @@ $("music-lyrics-btn").addEventListener("click",async()=>{
   try{
     const response=await authFetch("/api/lyrics",{method:"POST",signal:lyricAbort.signal,
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({model,genre,topic:topic||undefined})});
+      body:JSON.stringify({model,genre,topic:topic||undefined,seconds:Number($("music-seconds").value)})});
     if(!response.ok||!response.body){const data=await response.json().catch(()=>({}));throw new Error(data.error||"ส่งคำขอไม่สำเร็จ")}
     const reader=response.body.getReader(),decoder=new TextDecoder();
     let buffer="";
