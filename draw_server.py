@@ -30,6 +30,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -114,6 +115,16 @@ MUSIC_MAX_SECONDS = 240
 # mid-song (the "token budget before end token" console warning). Thai text
 # sings at about 6-9 chars/second, so cap the singable characters here.
 MUSIC_CHARS_PER_SEC = 7
+# Chat web mode: SearXNG on the same box answers queries in JSON; DuckDuckGo
+# Lite is the automatic fallback when that instance is down, so the chat never
+# blocks on a single engine. Queries leave the server either way (opt-in flag).
+SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888")
+WEB_SEARCH_RESULTS = 5    # snippets kept from the winning engine
+WEB_FETCH_PAGES = 3       # top hits whose pages get fetched for full text
+WEB_PAGE_CHARS = 1500     # text budget per fetched page
+WEB_SEARCH_TIMEOUT = 8    # seconds per engine call
+WEB_FETCH_TIMEOUT = 6     # seconds per page fetch
+WEB_CONTEXT_CHARS = 6000  # total budget injected into the prompt
 # One GPU, many users: each lane caps how many jobs run at once and the rest
 # wait in a FIFO with live queue positions. Chat (Ollama) and ComfyUI jobs
 # queue separately so simultaneous users never thrash the 12GB card.
@@ -700,6 +711,133 @@ def rag_knowledge_images(user_id, limit=RAG_MAX_IMAGES):
         except OSError:
             continue
     return images
+
+
+# ---- chat web mode: search engines + page reading (all stdlib) ----
+WEB_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+_BLOCK_TAGS_RE = re.compile(r"(?is)<(script|style|noscript)\b.*?</\1\s*>")
+_TAG_RE = re.compile(r"<[^>]+>")
+_DDG_LINK_RE = re.compile(
+    r"<a\b[^>]*\bclass=['\"]result-link['\"][^>]*>(.*?)</a>", re.S)
+_DDG_SNIPPET_RE = re.compile(
+    r"class=['\"]result-snippet['\"][^>]*>(.*?)</td>", re.S)
+
+
+def _strip_tags(fragment):
+    """Tags out, entities decoded, whitespace collapsed."""
+    text = _BLOCK_TAGS_RE.sub(" ", fragment)
+    text = _TAG_RE.sub(" ", text)
+    return html.unescape(re.sub(r"\s+", " ", text)).strip()
+
+
+def searxng_search(query):
+    """Ask the local SearXNG for JSON results; raises when unusable."""
+    url = SEARXNG_URL + "/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "json", "safesearch": 1})
+    req = urllib.request.Request(url, headers={"User-Agent": WEB_UA})
+    with urllib.request.urlopen(req, timeout=WEB_SEARCH_TIMEOUT) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    hits = [{"title": _strip_tags(str(h.get("title") or "")),
+             "url": str(h.get("url") or ""),
+             "snippet": _strip_tags(str(h.get("content") or ""))}
+            for h in (data.get("results") or [])]
+    hits = [h for h in hits if h["url"].startswith(("http://", "https://"))]
+    if not hits:
+        raise RuntimeError("searxng returned no usable results")
+    return hits[:WEB_SEARCH_RESULTS]
+
+
+def ddg_search(query):
+    """Scrape DuckDuckGo Lite — the fallback engine. Raises when unusable."""
+    url = "https://lite.duckduckgo.com/lite/?" + urllib.parse.urlencode(
+        {"q": query})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": WEB_UA, "Accept": "text/html"})
+    with urllib.request.urlopen(req, timeout=WEB_SEARCH_TIMEOUT) as r:
+        page = r.read(400_000).decode("utf-8", "replace")
+    hits, seen = [], set()
+    for match in _DDG_LINK_RE.finditer(page):
+        tag = match.group(0)
+        href = re.search(r"href=['\"]([^'\"]+)['\"]", tag)
+        if not href:
+            continue
+        link = href.group(1)
+        wrapped = re.search(r"[?&]uddg=([^&]+)", link)  # ddg redirect wrapper
+        if wrapped:
+            link = urllib.parse.unquote(wrapped.group(1))
+        host = urllib.parse.urlsplit(link).netloc.lower()
+        if not link.startswith(("http://", "https://")) \
+                or "duckduckgo.com" in host:  # ads / internal links
+            continue
+        title = _strip_tags(match.group(1))
+        if not title or link in seen:
+            continue
+        seen.add(link)
+        tail = page[match.end():match.end() + 6000]
+        snippet_m = _DDG_SNIPPET_RE.search(tail)
+        hits.append({"title": title, "url": link,
+                     "snippet": _strip_tags(snippet_m.group(1))
+                     if snippet_m else ""})
+        if len(hits) >= WEB_SEARCH_RESULTS:
+            break
+    if not hits:
+        raise RuntimeError("duckduckgo lite returned no usable results")
+    return hits
+
+
+def fetch_page_text(url):
+    """First WEB_PAGE_CHARS of readable text from a page; '' when unusable."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": WEB_UA, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+    with urllib.request.urlopen(req, timeout=WEB_FETCH_TIMEOUT) as r:
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "html" not in ctype and "text/plain" not in ctype:
+            return ""
+        raw = r.read(400_000)
+        charset = r.headers.get_content_charset() or "utf-8"
+    return _strip_tags(raw.decode(charset, "replace"))[:WEB_PAGE_CHARS]
+
+
+def _safe_fetch_page(url):
+    try:
+        return fetch_page_text(url)
+    except Exception:
+        return ""
+
+
+def web_research(query):
+    """Search, then read the top pages; prompt-ready blocks, never raises.
+
+    Returns (blocks, engine_name); ([], None) when both engines fail.
+    """
+    try:
+        hits, engine = searxng_search(query), "SearXNG"
+    except Exception:
+        try:
+            hits, engine = ddg_search(query), "DuckDuckGo"
+        except Exception:
+            return [], None
+    pages = {}
+    targets = [h["url"] for h in hits[:WEB_FETCH_PAGES]]
+    if targets:
+        with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+            for hit, text in zip(targets, pool.map(_safe_fetch_page, targets)):
+                if text:
+                    pages[hit] = text
+    blocks, budget = [], WEB_CONTEXT_CHARS
+    for hit in hits:
+        body = pages.get(hit["url"]) or hit["snippet"]
+        if not body:
+            continue
+        block = f"[เว็บ: {hit['title'] or hit['url']}] ({hit['url']})\n{body}"
+        if len(block) > budget:
+            block = block[:budget]
+        blocks.append(block)
+        budget -= len(block)
+        if budget <= 0:
+            break
+    return blocks, engine
 
 
 def chat_title(text):
@@ -2576,6 +2714,10 @@ class Handler(BaseHTTPRequestHandler):
             rag_hits = rag_retrieve(user["id"], question_text)
             if known[model_id]["vision"]:
                 rag_images = rag_knowledge_images(user["id"])
+        use_web = bool(body.get("web")) and bool(question_text)
+        web_blocks, web_engine = [], None
+        if use_web:
+            web_blocks, web_engine = web_research(question_text)
         try:
             pdf_notes = preprocess_pdf_docs(body, known[model_id]["vision"])
             if rag_hits:
@@ -2590,6 +2732,13 @@ class Handler(BaseHTTPRequestHandler):
                 rag_images = rag_images[:room]
                 if rag_images:
                     raw_messages[-1].setdefault("images", []).extend(rag_images)
+            if web_blocks:
+                last = raw_messages[-1]
+                prefix = ("ส่วนถัดไปคือผลการค้นหาจากอินเทอร์เน็ตสำหรับคำถามนี้ "
+                          "ใช้ประกอบการตอบเมื่อเกี่ยวข้อง และระบุชื่อเว็บที่อ้างอิง:\n\n")
+                last["content"] = ((last["content"].rstrip() + "\n\n")
+                                   if last["content"].strip() else "") \
+                    + prefix + "\n\n".join(web_blocks)
             messages, has_images, notes = build_chat_messages(
                 body, image_limit=CHAT_MAX_MODEL_IMAGES)
         except ValueError as e:
@@ -2611,6 +2760,11 @@ class Handler(BaseHTTPRequestHandler):
                 notes.append("📚 ยังไม่ได้อัปโหลดแหล่งความรู้ — อัปโหลดได้ในแท็บ จัดการเนื้อหา")
             else:
                 notes.append("📚 ไม่พบข้อความในแหล่งความรู้ที่เกี่ยวข้องกับคำถามนี้ จึงตอบจากความรู้ทั่วไป")
+        if use_web:
+            if web_blocks:
+                notes.append(f"🌐 ค้นเว็บแล้ว ใช้ได้ {len(web_blocks)} แหล่ง (ผ่าน {web_engine})")
+            else:
+                notes.append("🌐 ค้นเว็บไม่สำเร็จ จึงตอบจากความรู้ทั่วไปของโมเดล")
         # Auto-archive: keep the question (plus a note about attachments) and,
         # once the stream completes, the answer in the user's history.
         persist = None
@@ -2619,6 +2773,8 @@ class Handler(BaseHTTPRequestHandler):
             markers = list(attach_markers)
             if use_rag:
                 markers.append("ใช้แหล่งความรู้")
+            if use_web and web_blocks:
+                markers.append("ใช้ค้นเว็บ")
             if markers:
                 user_text = (user_text + "\n" if user_text else "") + \
                     "[" + ", ".join(markers) + "]"

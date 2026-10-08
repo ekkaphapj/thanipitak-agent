@@ -1485,6 +1485,139 @@ class LyricsPromptTest(unittest.TestCase):
             self.assertIn(needle, prompt)
 
 
+class WebSearchTest(unittest.TestCase):
+    """Engines and page reader behind the chat's web mode."""
+
+    def _response(self, body=b"", ctype="text/html; charset=utf-8"):
+        response = mock.MagicMock()
+        response.read.return_value = body
+        response.headers.get.return_value = ctype
+        response.headers.get_content_charset.return_value = "utf-8"
+        response.__enter__.return_value = response  # `with urlopen() as r`
+        response.__exit__.return_value = False
+        return response
+
+    def test_searxng_search_parses_json_and_drops_non_http(self):
+        payload = {"results": [
+            {"title": "หน้า <b>หลัก</b>", "url": "https://a.example/1",
+             "content": "คำตอบ 1"},
+            {"title": "bad", "url": "javascript:alert(1)", "content": "drop"},
+            {"title": "หน้าสอง", "url": "https://b.example/2", "content": ""},
+        ]}
+        with mock.patch.object(urllib.request, "urlopen",
+                               return_value=self._response(
+                                   json.dumps(payload).encode("utf-8"))) as urlopen:
+            hits = draw_server.searxng_search("ทดสอบ")
+        self.assertEqual([h["url"] for h in hits],
+                         ["https://a.example/1", "https://b.example/2"])
+        self.assertEqual(hits[0]["title"], "หน้า หลัก")
+        target = urlopen.call_args.args[0].full_url
+        self.assertTrue(target.startswith(draw_server.SEARXNG_URL))
+        self.assertIn("format=json", target)
+
+    def test_ddg_search_unwraps_redirects_and_skips_ads(self):
+        page = (
+            "<a rel='nofollow' href='https://example.com/one' class='result-link'>"
+            "ผล<b>แรก</b></a>"
+            "<td class='result-snippet'>รายละเอียด &amp; สรุป</td>"
+            "<a rel='nofollow' "
+            "href='https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Ftwo&rut=x' "
+            "class='result-link'>ผลที่สอง</a>"
+            "<td class='result-snippet'>snippet สอง</td>"
+            "<a rel='nofollow' href='https://duckduckgo.com/y.js' class='result-link'>โฆษณา</a>"
+            "<a rel='nofollow' href='https://example.com/one' class='result-link'>ซ้ำ</a>")
+        with mock.patch.object(urllib.request, "urlopen",
+                               return_value=self._response(page.encode("utf-8"))):
+            hits = draw_server.ddg_search("q")
+        self.assertEqual([h["url"] for h in hits],
+                         ["https://example.com/one", "https://example.com/two"])
+        self.assertEqual(hits[0]["snippet"], "รายละเอียด & สรุป")
+        self.assertEqual(hits[1]["snippet"], "snippet สอง")
+
+    def test_web_research_falls_back_to_ddg_and_uses_snippets(self):
+        with mock.patch.object(draw_server, "searxng_search",
+                               side_effect=RuntimeError("down")), \
+             mock.patch.object(draw_server, "ddg_search", return_value=[
+                 {"title": "หนึ่ง", "url": "https://x/1", "snippet": "s1"},
+                 {"title": "สอง", "url": "https://x/2", "snippet": "s2"}]), \
+             mock.patch.object(draw_server, "_safe_fetch_page",
+                               side_effect=["page one text", ""]):
+            blocks, engine = draw_server.web_research("q")
+        self.assertEqual(engine, "DuckDuckGo")
+        self.assertEqual(len(blocks), 2)
+        self.assertIn("[เว็บ: หนึ่ง] (https://x/1)\npage one text", blocks[0])
+        self.assertIn("s2", blocks[1])  # snippet fills in when the page 404s
+
+    def test_web_research_reports_failure_when_both_engines_down(self):
+        with mock.patch.object(draw_server, "searxng_search",
+                               side_effect=RuntimeError), \
+             mock.patch.object(draw_server, "ddg_search",
+                               side_effect=RuntimeError):
+            self.assertEqual(draw_server.web_research("q"), ([], None))
+
+    def test_fetch_page_text_strips_tags_and_caps_length(self):
+        body = ("<html><head><style>.x{color}</style></head><body>"
+                "<script>evil()</script><p>สวัสดี</p> ครับ" + "y" * 5000 +
+                "</body></html>")
+        with mock.patch.object(urllib.request, "urlopen",
+                               return_value=self._response(body.encode("utf-8"))):
+            text = draw_server.fetch_page_text("https://x/")
+        self.assertNotIn("<", text)
+        self.assertIn("สวัสดี ครับ", text)
+        self.assertNotIn("evil", text)
+        self.assertLessEqual(len(text), draw_server.WEB_PAGE_CHARS)
+
+    def test_fetch_page_text_skips_binary_content(self):
+        with mock.patch.object(urllib.request, "urlopen",
+                               return_value=self._response(
+                                   b"ID3", ctype="audio/mpeg")):
+            self.assertEqual(draw_server.fetch_page_text("https://x/a.mp3"), "")
+
+
+class WebChatHttpTest(ChatServerTest):
+    def _chat(self, body):
+        with self.ollama_mock([{"message": {"content": "ตอบ"}, "done": True}]) as urlopen, \
+             mock.patch.object(draw_server, "chat_model_ready", return_value=True), \
+             mock.patch.object(draw_server, "free_comfy_vram"), \
+             mock.patch.object(draw_server, "warm_chat_model"):
+            with self.chat_post(body) as response:
+                streamed = response.read().decode()
+        return urlopen, [json.loads(l) for l in streamed.splitlines() if l.strip()]
+
+    def test_web_flag_injects_sources_and_note(self):
+        body = {"model": "qwen3:8b", "messages": [
+            {"role": "user", "content": "อากาศวันนี้"}], "web": True}
+        with mock.patch.object(draw_server, "web_research", return_value=(
+                ["[เว็บ: ข่าวสด] (https://n.example/x)\nฝนตก"], "SearXNG")) as research:
+            urlopen, rows = self._chat(body)
+        research.assert_called_once_with("อากาศวันนี้")
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertIn("ผลการค้นหาจากอินเทอร์เน็ต", sent["messages"][-1]["content"])
+        self.assertIn("https://n.example/x", sent["messages"][-1]["content"])
+        self.assertIn("อากาศวันนี้", sent["messages"][-1]["content"])
+        notes = [n for r in rows for n in r.get("notes", [])]
+        self.assertTrue(any("ค้นเว็บแล้ว" in n and "SearXNG" in n for n in notes))
+
+    def test_web_flag_failure_notifies_and_answers_without_sources(self):
+        body = {"model": "qwen3:8b", "messages": [
+            {"role": "user", "content": "อะไรก็ได้"}], "web": True}
+        with mock.patch.object(draw_server, "web_research", return_value=([], None)):
+            urlopen, rows = self._chat(body)
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertNotIn("ผลการค้นหาจากอินเทอร์เน็ต", sent["messages"][-1]["content"])
+        notes = [n for r in rows for n in r.get("notes", [])]
+        self.assertTrue(any("ค้นเว็บไม่สำเร็จ" in n for n in notes))
+
+    def test_web_flag_off_never_searches(self):
+        body = {"model": "qwen3:8b", "messages": [
+            {"role": "user", "content": "ทั่วไป"}]}
+        with mock.patch.object(draw_server, "web_research") as research:
+            urlopen, rows = self._chat(body)
+        research.assert_not_called()
+        sent = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(sent["messages"][-1]["content"], "ทั่วไป")
+
+
 class MusicHttpTest(unittest.TestCase):
     def setUp(self):
         draw_server.JOBS.clear()

@@ -367,6 +367,7 @@ a.link-btn{text-decoration:none}
         <label class="hint" for="chat-model" style="margin:0">โมเดล</label>
         <select id="chat-model" disabled><option value="">กำลังโหลดโมเดล…</option></select>
         <label class="rag-toggle" for="rag-toggle" title="ให้ AI ใช้ไฟล์ที่อัปโหลดในแท็บ จัดการเนื้อหา ประกอบคำตอบ"><input type="checkbox" id="rag-toggle">📚 ใช้แหล่งความรู้</label>
+        <label class="rag-toggle" for="web-toggle" title="ให้ AI ค้นอินเทอร์เน็ตประกอบคำตอบ (คำถามจะถูกส่งไปเครื่องมือค้นหา)"><input type="checkbox" id="web-toggle">🌐 ค้นเว็บ</label>
         <button type="button" class="ghost-btn" id="chat-clear">ล้างบทสนทนา</button>
       </div>
     </div>
@@ -992,7 +993,7 @@ $("chat-form").addEventListener("submit",async event=>{
   }
   input.value="";autoGrow(input);chatAtts=[];renderAtts();
   const reply=addBubble("assistant");
-  reply.innerHTML='<span class="cursor"></span>';
+  reply.innerHTML=$("web-toggle").checked&&text?'🌐 กำลังค้นเว็บและอ่านหน้าเว็บ… <span class="cursor"></span>':'<span class="cursor"></span>';
   chatBusy=true;$("chat-send").disabled=true;$("chat-send").style.display="none";$("chat-stop").style.display="inline-block";
   chatAbort=new AbortController();
   let full="",userContent=null;const streamNotes=[];
@@ -1001,7 +1002,7 @@ $("chat-form").addEventListener("submit",async event=>{
   try{
     const response=await authFetch("/api/chat",{method:"POST",signal:chatAbort.signal,
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({model,messages:[...chatHistory,{role:"user",content:text,images,docs}],chat_session:currentChatSession||undefined,rag:$("rag-toggle").checked||undefined})});
+      body:JSON.stringify({model,messages:[...chatHistory,{role:"user",content:text,images,docs}],chat_session:currentChatSession||undefined,rag:$("rag-toggle").checked||undefined,web:$("web-toggle").checked||undefined})});
     if(!response.ok||!response.body){const data=await response.json().catch(()=>({}));throw new Error(data.error||"ส่งข้อความไม่สำเร็จ")}
     const reader=response.body.getReader(),decoder=new TextDecoder();
     let buffer="";
