@@ -13,6 +13,7 @@ models/
 output/
 input/draw_refs/
 user_data/
+outputs/
 *.safetensors
 *.gguf
 *.ckpt
