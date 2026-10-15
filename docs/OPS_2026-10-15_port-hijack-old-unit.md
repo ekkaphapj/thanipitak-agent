@@ -30,11 +30,13 @@ printf '<sudo pw>\n' | sudo -S -p '' systemctl restart qwen-draw@ekkaphap
 - เทสต์บนเซิร์ฟเวอร์: `python3 -m unittest discover -s tests` → **Ran 127 tests — OK**
 - บริการอื่นหลังรีบูต: `comfyui`, `searxng`, `cloudflared` = active ทั้งหมด
 
-## ค้างในใจ
+## ตามรอยการล้างของเก่า (วันเดียวกัน)
 
-- ไฟล์ unit เก่า `/etc/systemd/system/qwen-draw.service` ยังอยู่แต่ **disabled แล้ว** (จะไม่ขึ้นตอนบูต) — ถ้าจะลบทิ้งให้ยืนยันจากเจ้าของก่อน
-- โฟลเดอร์เก่า `~/draw-server` (สำเนายุค 28 ก.ย.) ยังอยู่บนดิสก์ ไม่ได้แตะ — ควรเก็บกวาด/ย้าย archive วันหลัง
-- ผู้ใช้ที่เปิดหน้าเว็บค้างไว้ตั้งแต่เช้า อาจต้องกด Ctrl+F5 หนึ่งครั้ง
+ยืนยันก่อนลบว่า `~/draw-server` เป็นแค่ checkout เก่า (HEAD `28f5b2b`, 752 KB, working tree สะอาด, ไม่มี outputs/user_data/.env) แล้วลบทิ้งทั้งหมด:
+
+- `rm -rf ~/draw-server`
+- `sudo rm /etc/systemd/system/qwen-draw.service` + `systemctl daemon-reload` — `systemctl status qwen-draw.service` ขึ้น "could not be found"
+- หลังลบ: `qwen-draw@ekkaphap` ยัง active และโดเมนยังเสิร์ฟหน้าใหม่ปกติ
 
 ## บทเรียน
 
