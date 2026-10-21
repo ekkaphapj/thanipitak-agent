@@ -92,6 +92,9 @@ class CodexArgsTest(unittest.TestCase):
         args = draw_server.codex_command_args("งานต่อ", "abc-123")
         self.assertEqual(args[1:4], ["exec", "resume", "abc-123"])
         self.assertEqual(args[-1], "งานต่อ")
+        # exec resume rejects -C/-s: session keeps its own workspace/sandbox
+        self.assertNotIn("-C", args)
+        self.assertNotIn("-s", args)
 
 
 class CodexEventTest(unittest.TestCase):

@@ -2059,10 +2059,14 @@ def run_job(job_id, spec, ref_path=None, user=None):
 def codex_command_args(prompt, thread_id=None):
     """argv for one non-interactive codex turn. With a stored thread_id the
     turn resumes that session, keeping the web chat in one conversation.
-    --json makes codex print one JSON object per stdout line."""
+    --json makes codex print one JSON object per stdout line.
+    `exec resume` shares only some flags with `exec` (-C/-s are rejected
+    there); a resumed session already knows its workspace and sandbox."""
     args = [CODEX_BIN, "exec"]
     if thread_id:
-        args += ["resume", thread_id]
+        args += ["resume", thread_id, "--json",
+                 "-c", 'approval_policy="never"']
+        return args + [prompt]
     args += ["--json", "-C", CODEX_PROJECT_DIR, "-s", "workspace-write",
              "-c", 'approval_policy="never"']
     return args + [prompt]
