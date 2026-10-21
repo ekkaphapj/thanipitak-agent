@@ -125,22 +125,6 @@ WEB_PAGE_CHARS = 1500     # text budget per fetched page
 WEB_SEARCH_TIMEOUT = 8    # seconds per engine call
 WEB_FETCH_TIMEOUT = 6     # seconds per page fetch
 WEB_CONTEXT_CHARS = 6000  # total budget injected into the prompt
-# --- Codex tasking (แท็บ 🤖 ธานีพิทักษ์) --------------------------------
-# The web UI drives the Codex CLI agent inside a project checkout on this
-# server. One job at a time; the codex session survives across jobs so the
-# next prompt continues the same conversation (codex exec resume).
-CODEX_BIN = os.environ.get("CODEX_BIN", str(Path.home() / ".local" / "bin" / "codex"))
-CODEX_PROJECT_DIR = os.environ.get(
-    "CODEX_PROJECT_DIR", str(Path.home() / "udonpolice-datacenter"))
-# Extra usernames allowed besides admins (comma separated); empty = admin only
-CODEX_ALLOWED_USERS = {u.strip().lower() for u in
-                       os.environ.get("CODEX_ALLOWED_USERS", "").split(",")
-                       if u.strip()}
-CODEX_TIMEOUT = float(os.environ.get("CODEX_TIMEOUT", "1800"))
-CODEX_MAX_PROMPT = 4000
-CODEX_MAX_EVENTS = 500     # newest events kept per job for polling
-CODEX_LOCK = threading.Lock()
-CODEX_STATE = {"thread_id": None, "job": None}
 # One GPU, many users: each lane caps how many jobs run at once and the rest
 # wait in a FIFO with live queue positions. Chat (Ollama) and ComfyUI jobs
 # queue separately so simultaneous users never thrash the 12GB card.
@@ -2056,160 +2040,6 @@ def run_job(job_id, spec, ref_path=None, user=None):
                 pass
 
 
-def codex_command_args(prompt, thread_id=None):
-    """argv for one non-interactive codex turn. With a stored thread_id the
-    turn resumes that session, keeping the web chat in one conversation.
-    --json makes codex print one JSON object per stdout line.
-    `exec resume` shares only some flags with `exec` (-C/-s are rejected
-    there); a resumed session already knows its workspace and sandbox."""
-    args = [CODEX_BIN, "exec"]
-    if thread_id:
-        args += ["resume", thread_id, "--json",
-                 "-c", 'approval_policy="never"']
-        return args + [prompt]
-    args += ["--json", "-C", CODEX_PROJECT_DIR, "-s", "workspace-write",
-             "-c", 'approval_policy="never"']
-    return args + [prompt]
-
-
-def codex_apply_event(job, evt):
-    """Fold one codex --json line into the job dict. Event shapes move between
-    codex versions, so unknown types are stored verbatim and the browser only
-    renders what it recognises."""
-    if not isinstance(evt, dict):
-        return
-    kind = evt.get("type")
-    if kind == "thread.started" and evt.get("thread_id"):
-        job["thread_id"] = evt["thread_id"]
-    elif kind == "turn.completed":
-        job["usage"] = evt.get("usage") or {}
-    elif kind == "error":
-        job["error"] = str(evt.get("message") or evt)[:500]
-    if kind in ("token_count", "thread.started"):  # noise / no display value
-        return
-    item = evt.get("item")
-    if isinstance(item, dict):
-        evt = dict(evt)
-        evt["item"] = _sanitize_codex_item(item)
-    job["events"].append(evt)
-    if len(job["events"]) > CODEX_MAX_EVENTS:
-        del job["events"][:len(job["events"]) - CODEX_MAX_EVENTS]
-        job["truncated"] = True
-
-
-def _sanitize_codex_item(item):
-    """Trim fields that can flood the poll payload (command output, long text)."""
-    out = dict(item)
-    kind = out.get("type")
-    if kind == "command_execution":
-        out["command"] = str(out.get("command") or "")[:500]
-        if isinstance(out.get("aggregated_output"), str):
-            out["aggregated_output"] = out["aggregated_output"][-1200:]
-    elif kind == "agent_message":
-        out["text"] = str(out.get("text") or "")[:8000]
-    return out
-
-
-def run_codex_job(job):
-    """Run one codex exec turn, streaming JSONL events into the job dict."""
-    with CODEX_LOCK:
-        thread_id = CODEX_STATE["thread_id"]
-    argv = codex_command_args(job["prompt"], thread_id)
-    stderr_buf = []
-    rc = None
-    try:
-        proc = subprocess.Popen(
-            argv, cwd=CODEX_PROJECT_DIR, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace", start_new_session=True)
-
-        def drain(pipe, sink):
-            for line in pipe:
-                sink(line)
-        pumps = [
-            threading.Thread(target=drain, daemon=True, args=(
-                proc.stdout, lambda line: _codex_pump_line(job, line))),
-            threading.Thread(target=drain, daemon=True, args=(
-                proc.stderr, stderr_buf.append)),
-        ]
-        for pump in pumps:
-            pump.start()
-        deadline = time.time() + CODEX_TIMEOUT
-        while True:
-            try:
-                rc = proc.wait(timeout=5)
-                break
-            except subprocess.TimeoutExpired:
-                if time.time() >= deadline:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    job["error"] = (f"หมดเวลา {int(CODEX_TIMEOUT)} วินาที "
-                                    "— หยุดงานค้างไว้แล้ว")
-                    rc = proc.returncode if proc.returncode is not None else -15
-                    break
-        for pump in pumps:
-            pump.join(timeout=5)
-        with CODEX_LOCK:
-            if job.get("error"):
-                job["status"] = "error"
-            elif rc != 0:
-                tail = "".join(stderr_buf[-8:])[-600:].strip()
-                job["error"] = f"codex จบด้วยรหัส {rc}" + (f": {tail}" if tail else "")
-                job["status"] = "error"
-            else:
-                job["status"] = "done"
-            job["finished"] = time.time()
-            if job.get("thread_id"):
-                CODEX_STATE["thread_id"] = job["thread_id"]
-    except FileNotFoundError:
-        with CODEX_LOCK:
-            job["status"] = "error"
-            job["error"] = f"ไม่พบ codex binary ที่ {CODEX_BIN}"
-            job["finished"] = time.time()
-    except Exception as e:  # keep the slot usable after any worker crash
-        with CODEX_LOCK:
-            job["status"] = "error"
-            job["error"] = str(e)[:500]
-            job["finished"] = time.time()
-
-
-def _codex_pump_line(job, line):
-    line = line.strip()
-    if not line:
-        return
-    try:
-        evt = json.loads(line)
-    except json.JSONDecodeError:
-        evt = {"type": "raw", "text": line[:400]}
-    with CODEX_LOCK:
-        codex_apply_event(job, evt)
-
-
-def codex_status_payload(allowed):
-    with CODEX_LOCK:
-        payload = {
-            "allowed": allowed,
-            "busy": bool(CODEX_STATE["job"]
-                         and CODEX_STATE["job"]["status"] == "running"),
-            "session_active": bool(CODEX_STATE["thread_id"]),
-            "project_dir": CODEX_PROJECT_DIR,
-            "job": None,
-        }
-        job = CODEX_STATE["job"]
-        if job:
-            payload["job"] = {
-                "id": job["id"], "status": job["status"], "prompt": job["prompt"],
-                "started": job["started"], "finished": job.get("finished"),
-                "error": job.get("error"), "usage": job.get("usage"),
-                "truncated": job.get("truncated", False),
-                "event_count": len(job["events"]), "events": list(job["events"]),
-            }
-        return payload
-
-
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8",
               cache=None):
@@ -2491,8 +2321,6 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/queue":
             self._send(200, {"comfy": COMFY_GATE.snapshot(),
                              "chat": CHAT_GATE.snapshot()})
-        elif route == "/api/codex/status":
-            self._handle_codex_status()
         elif route == "/api/storage":
             user = self._current_user()
             if not user:
@@ -2638,12 +2466,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/memory/clear":
             self._handle_memory_clear()
-            return
-        if route == "/api/codex/send":
-            self._handle_codex_send()
-            return
-        if route == "/api/codex/reset":
-            self._handle_codex_reset()
             return
         if route == "/api/docs":
             self._handle_docs_upload()
@@ -2792,70 +2614,6 @@ class Handler(BaseHTTPRequestHandler):
             "style": style, "lyrics": lyrics, "seconds": seconds,
             "seed": seed, "planning": planning}, owner), daemon=True).start()
         self._send(200, {"id": job_id, "seed": seed})
-
-    def _codex_allowed(self):
-        """Admins always; others only when listed in CODEX_ALLOWED_USERS."""
-        info = self._session()
-        if not info:
-            return False
-        return bool(info["admin"]
-                    or str(info.get("username") or "").lower() in CODEX_ALLOWED_USERS)
-
-    def _handle_codex_status(self):
-        self._send(200, codex_status_payload(self._codex_allowed()))
-
-    def _handle_codex_send(self):
-        if not self._codex_allowed():
-            self._send(403, {"error": "แท็บนี้ใช้ได้เฉพาะผู้ดูแลระบบ"})
-            return
-        body = self._read_json(65536)
-        if body is None:
-            return
-        prompt = str(body.get("prompt", "")).strip()
-        if not prompt or len(prompt) > CODEX_MAX_PROMPT:
-            self._send(400, {"error": f"พิมพ์งาน 1-{CODEX_MAX_PROMPT} ตัวอักษร"})
-            return
-        with CODEX_LOCK:
-            job = CODEX_STATE["job"]
-            if job and job["status"] == "running":
-                busy = True
-            else:
-                busy = False
-                if not os.path.isfile(CODEX_BIN):
-                    self._send(503, {"error": f"ไม่พบ codex binary ที่ {CODEX_BIN}"})
-                    return
-                if not os.path.isdir(CODEX_PROJECT_DIR):
-                    self._send(503, {"error":
-                                     f"ไม่พบโฟลเดอร์โปรเจกต์ {CODEX_PROJECT_DIR}"})
-                    return
-                info = self._session()
-                job = {"id": uuid.uuid4().hex[:12], "status": "running",
-                       "prompt": prompt, "events": [], "started": time.time(),
-                       "user": info.get("username"), "thread_id": None,
-                       "usage": None, "error": None, "truncated": False}
-                CODEX_STATE["job"] = job
-        if busy:
-            self._send(409, {"error": "มีงาน codex กำลังทำอยู่ รอให้จบก่อน",
-                             "busy": True})
-            return
-        threading.Thread(target=run_codex_job, args=(job,), daemon=True).start()
-        self._send(200, {"id": job["id"]})
-
-    def _handle_codex_reset(self):
-        """Drop the stored codex session; the next prompt starts a fresh one."""
-        if not self._codex_allowed():
-            self._send(403, {"error": "แท็บนี้ใช้ได้เฉพาะผู้ดูแลระบบ"})
-            return
-        with CODEX_LOCK:
-            running = bool(CODEX_STATE["job"]
-                           and CODEX_STATE["job"]["status"] == "running")
-        if running:
-            self._send(409, {"error": "มีงานกำลังทำอยู่ รอให้จบก่อนเริ่มเซสชันใหม่"})
-            return
-        with CODEX_LOCK:
-            CODEX_STATE["thread_id"] = None
-            CODEX_STATE["job"] = None
-        self._send(200, {"ok": True})
 
     def _handle_memory_clear(self):
         """Unload every model from the GPU: ComfyUI first, then Ollama.

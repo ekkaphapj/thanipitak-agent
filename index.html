@@ -284,7 +284,6 @@ a.link-btn{text-decoration:none}
   <button type="button" class="tab active" id="tab-chat">💬 AI Webchat</button>
   <button type="button" class="tab" id="tab-music">🎵 สร้างเพลง</button>
   <button type="button" class="tab" id="tab-draw">🎨 สร้างรูปภาพ</button>
-  <button type="button" class="tab" id="tab-codex">🤖 ธานีพิทักษ์</button>
   <button type="button" class="tab" id="tab-manage">🗂 จัดการเนื้อหา</button>
   <span class="queue-badge" id="queue-badge" role="status" aria-live="polite" hidden></span>
 </nav>
@@ -479,24 +478,6 @@ a.link-btn{text-decoration:none}
   </div>
 </section>
 </section>
-<section id="codex-page" hidden aria-label="สั่งงาน Codex แก้ระบบธานีพิทักษ์">
-  <div class="chat-panel" style="display:flex;flex-direction:column;min-height:64dvh">
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
-      <span class="chip chip-mini" id="codex-badge">🤖 Codex</span>
-      <span class="hint" id="codex-session" style="margin:0"></span>
-      <span style="flex:1"></span>
-      <button type="button" class="chip chip-mini" id="codex-reset" hidden>🧹 เริ่มเซสชันใหม่</button>
-    </div>
-    <div class="chat-log" id="codex-log" style="max-height:60dvh" aria-live="polite">
-      <div class="chat-empty" id="codex-empty"><div class="empty-icon" aria-hidden="true">🤖</div>สั่งงาน Codex แก้โค้ดระบบธานีพิทักษ์ได้จากที่นี่<br>พิมพ์งานแล้วกดส่ง — งานรันบนเซิร์ฟเวอร์ ปิดจอได้ กลับมาดูผลทีหลังได้</div>
-    </div>
-    <p class="hint" id="codex-status" role="status" aria-live="polite" hidden></p>
-    <form id="codex-form" class="chat-form">
-      <textarea id="codex-input" rows="1" maxlength="4000" placeholder="เช่น อ่าน .agents/HANDOFF.md แล้วสรุปการเปลี่ยนแปลงล่าสุด… (Enter ส่ง)"></textarea>
-      <button class="send-btn" id="codex-send" type="submit">ส่ง ➤</button>
-    </form>
-  </div>
-</section>
 <section id="manage-page" hidden aria-label="จัดการเนื้อหาของฉัน">
 <section class="panel form-panel">
   <div class="panel-heading"><span class="step">🗂</span><h3>จัดการเนื้อหาของฉัน</h3></div>
@@ -627,18 +608,16 @@ $("ref-input").addEventListener("change",async event=>{
 $("ref-clear").addEventListener("click",()=>{setReference(null);setStatus("พร้อมสร้างภาพ")});
 document.querySelectorAll("[data-prompt]").forEach(button=>button.addEventListener("click",()=>{$("prompt").value=button.dataset.prompt;$("prompt").focus()}));
 /* ---- tabs + local webchat ---- */
-const pages={draw:$("draw-page"),chat:$("chat-page"),music:$("music-page"),codex:$("codex-page"),manage:$("manage-page")};
-let chatModelsLoaded=false,chatHistory=[],chatAtts=[],chatBusy=false,musicReady=false,codexLoaded=false;
+const pages={draw:$("draw-page"),chat:$("chat-page"),music:$("music-page"),manage:$("manage-page")};
+let chatModelsLoaded=false,chatHistory=[],chatAtts=[],chatBusy=false,musicReady=false;
 function showPage(name){
-  for(const k of ["chat","music","draw","codex","manage"]){pages[k].hidden=k!==name;$("tab-"+k).classList.toggle("active",k===name)}
+  for(const k of ["chat","music","draw","manage"]){pages[k].hidden=k!==name;$("tab-"+k).classList.toggle("active",k===name)}
   if(name==="chat"&&!chatModelsLoaded)loadChatModels();
-  if(name==="codex"&&!codexLoaded)codexInit();
   if(name==="manage"){loadStorage();loadLibrary();loadDocs()}
 }
 $("tab-draw").addEventListener("click",()=>showPage("draw"));
 $("tab-chat").addEventListener("click",()=>showPage("chat"));
 $("tab-music").addEventListener("click",()=>showPage("music"));
-$("tab-codex").addEventListener("click",()=>showPage("codex"));
 $("tab-manage").addEventListener("click",()=>showPage("manage"));
 /* ---- user library: chat history, saved images and music ---- */
 const CHAT_EMPTY_HTML='<div class="chat-empty" id="chat-empty"><div class="empty-icon" aria-hidden="true">💬</div>เริ่มบทสนทนาได้เลย — ถามอะไรก็ได้ทั้งภาษาไทยและอังกฤษ<br>แนบเอกสารหรือรูปภาพมาถามได้จากช่องด้านล่าง</div>';
@@ -1302,112 +1281,6 @@ async function checkSession(){
   showLogin();
 }
 checkSession();
-/* ---- แท็บธานีพิทักษ์: สั่งงาน codex บนเซิร์ฟเวอร์ ---- */
-let codexJobId=null,codexRendered=0,codexTimer=null;
-function codexSetStatus(text){const el=$("codex-status");el.hidden=!text;el.textContent=text||""}
-function codexBubble(role,cls){
-  $("codex-empty")?.remove();
-  const div=document.createElement("div");
-  div.className="msg "+role+(cls?" "+cls:"");
-  $("codex-log").appendChild(div);
-  $("codex-log").scrollTop=$("codex-log").scrollHeight;
-  return div;
-}
-function codexActivity(text,mono){
-  const div=codexBubble("assistant","mini");
-  div.style.whiteSpace=mono?"pre-wrap":"normal";
-  div.style.fontSize="12.5px";
-  div.style.opacity=".92";
-  div.textContent=text;
-  return div;
-}
-function codexRenderEvent(evt){
-  const kind=evt.type,item=evt.item;
-  if(kind==="turn.started"){codexSetStatus("🤖 กำลังคิด…");return}
-  if(kind==="turn.completed"){
-    const u=evt.usage||{},io=(u.input_tokens||u.cached_input_tokens||0)+"→"+(u.output_tokens||0);
-    codexActivity("✅ เสร็จ (โทเคน "+io+")");return}
-  if(kind==="error"){codexBubble("assistant","error").textContent="⚠️ "+(evt.message||JSON.stringify(evt).slice(0,300));return}
-  if(kind!=="item.completed"||!item)return;
-  if(item.type==="agent_message"){
-    const b=codexBubble("assistant");
-    b.style.whiteSpace="pre-wrap";
-    b.textContent=item.text||"(ไม่มีข้อความ)";
-  }else if(item.type==="command_execution"){
-    const div=codexActivity("$ "+(item.command||"")+"  → exit "+(item.exit_code??"?"),true);
-    if(item.aggregated_output){
-      const d=document.createElement("details");d.style.marginTop="6px";
-      const s=document.createElement("summary");s.textContent="ผลลัพธ์";s.style.cursor="pointer";
-      const pre=document.createElement("pre");pre.style.margin="4px 0 0";pre.textContent=item.aggregated_output;
-      d.append(s,pre);div.appendChild(d);
-    }
-  }else if(item.type==="file_change"){
-    const files=(item.changes||[]).map(c=>c.path).filter(Boolean);
-    if(files.length)codexActivity("📝 แก้ไฟล์: "+files.join(", "),true);
-  }else if(item.type==="error"){
-    codexBubble("assistant","error").textContent="⚠️ "+(item.message||"error");
-  }
-}
-async function codexPoll(){
-  let data;
-  try{data=await jsonResponse(await authFetch("/api/codex/status",{cache:"no-store"}))}catch{return}
-  const form=$("codex-form"),input=$("codex-input");
-  if(data.allowed===false){
-    form.hidden=true;codexSetStatus("🔒 แท็บนี้ใช้ได้เฉพาะผู้ดูแลระบบ");
-    $("codex-reset").hidden=true;return;
-  }
-  $("codex-session").textContent=(data.session_active?"เซสชันต่อเนื่อง":"เซสชันใหม่")+" · "+(data.project_dir||"").split("/").pop();
-  $("codex-reset").hidden=false;
-  const job=data.job;
-  if(!job){form.hidden=false;input.disabled=false;$("codex-send").disabled=false;codexSetStatus("");return}
-  if(job.id!==codexJobId||job.events.length<codexRendered){
-    codexJobId=job.id;codexRendered=0;
-    $("codex-log").replaceChildren();codexBubble("user").textContent=job.prompt;
-  }
-  for(const evt of job.events.slice(codexRendered)){codexRenderEvent(evt)}
-  codexRendered=job.events.length;
-  const busy=job.status==="running";
-  input.disabled=busy;$("codex-send").disabled=busy;
-  if(busy){codexSetStatus("⚙️ กำลังทำงาน… "+new Date(job.started*1000).toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"})+" →")}
-  else{
-    if(job.status==="error")codexSetStatus("⚠️ "+(job.error||"ผิดพลาด"));
-    else codexSetStatus("✅ เสร็จแล้ว — พิมพ์งานต่อได้ (สนทนาต่อเนื่อง)");
-    if(job.status==="error"&&job.error)codexBubble("assistant","error").textContent="⚠️ "+job.error;
-  }
-}
-function codexInit(){
-  codexLoaded=true;
-  codexPoll();
-  clearInterval(codexTimer);
-  codexTimer=setInterval(codexPoll,3000);
-  $("codex-form").addEventListener("submit",async e=>{
-    e.preventDefault();
-    const input=$("codex-input"),prompt=input.value.trim();
-    if(!prompt||input.disabled)return;
-    input.value="";autoGrow(input);
-    try{
-      await authFetch("/api/codex/send",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({prompt})});
-      codexPoll();
-    }catch(err){
-      let msg="ส่งงานไม่สำเร็จ";
-      try{msg=(await err.json?.()).error||msg}catch{}
-      codexSetStatus("⚠️ "+msg);
-    }
-  });
-  $("codex-input").addEventListener("keydown",e=>{
-    if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();$("codex-form").requestSubmit()}
-  });
-  $("codex-input").addEventListener("input",e=>autoGrow(e.target));
-  $("codex-reset").addEventListener("click",async()=>{
-    if(!confirm("เริ่มเซสชันใหม่? บทสนทนาเดิมจะไม่ถูกนำไปใช้ต่อ"))return;
-    try{
-      await authFetch("/api/codex/reset",{method:"POST"});
-      codexJobId=null;$("codex-log").replaceChildren();
-      $("codex-log").innerHTML='<div class="chat-empty" id="codex-empty"><div class="empty-icon" aria-hidden="true">🤖</div>เริ่มเซสชันใหม่แล้ว — พิมพ์งานแรกได้เลย</div>';
-      codexPoll();
-    }catch(err){codexSetStatus("⚠️ เริ่มเซสชันใหม่ไม่สำเร็จ (มีงานกำลังทำอยู่?)")}
-  });
-}
 </script>
 </body>
 </html>
