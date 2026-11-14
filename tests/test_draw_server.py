@@ -1886,5 +1886,134 @@ class LoginFlowTest(unittest.TestCase):
         error.exception.close()
 
 
+class SiteHttpTest(ChatServerTest):
+    """Published chat pages: POST /api/sites + public GET /s/<id>/<key>/."""
+
+    PNG_1PX = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+        "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+
+    def publish(self, **body):
+        return post_json(self.base, "/api/sites", body, token=self.auth["Authorization"][7:])
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=5) as response:
+            return response.status, response.headers, response.read()
+
+    def test_publishes_html_with_assets_and_serves_publicly(self):
+        html = "<!DOCTYPE html><html><body><h1>แดชบอร์ดทดสอบ</h1>" \
+               '<img src="logo.png"></body></html>'
+        with self.publish(name="หน้าทดสอบ", html=html,
+                          files=[{"name": "logo.png",
+                                  "data": base64.b64encode(self.PNG_1PX).decode()}]) as r:
+            data = json.load(r)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["url"].startswith("/s/"))
+        # the link opens without a login (sharing is the point)
+        status, headers, page = self.get(data["url"])
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["Content-Type"])
+        self.assertIn("แดชบอร์ดทดสอบ", page.decode("utf-8"))
+        status, headers, blob = self.get(data["url"] + "logo.png")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/png")  # sniffed, not by name
+        self.assertEqual(blob, self.PNG_1PX)
+
+    def test_content_type_follows_bytes_not_filename(self):
+        jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+        with self.publish(files=[{"name": "photo.png",
+                                  "data": base64.b64encode(jpeg).decode()}]) as r:
+            data = json.load(r)
+        _, headers, _ = self.get(data["url"] + "photo.png")
+        self.assertEqual(headers["Content-Type"], "image/jpeg")
+
+    def test_files_only_page_gets_auto_gallery(self):
+        with self.publish(name="คลังรูป", files=[
+                {"name": "a.png", "data": base64.b64encode(self.PNG_1PX).decode()}]) as r:
+            data = json.load(r)
+        _, headers, page = self.get(data["url"])
+        self.assertIn("text/html", headers["Content-Type"])
+        self.assertIn('src="a.png"', page.decode("utf-8"))
+
+    def test_wrong_key_or_unknown_site_is_404(self):
+        with self.publish(html="<html>x</html>") as r:
+            data = json.load(r)
+        _, _, sid, skey, _ = data["url"].split("/")
+        for path in (f"/s/{sid}/{'0' * 16}/", "/s/deadbeef/notthekey/"):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.get(path)
+            self.assertEqual(error.exception.code, 404)
+            error.exception.close()
+
+    def test_traversal_and_index_collisions_are_blocked(self):
+        with self.publish(html="<html>x</html>") as r:
+            data = json.load(r)
+        url = data["url"]
+        for probe in ("%2e%2e%2fusers.db", "..%2fusers.db", "%252e%252e%2fusers.db",
+                      "sub/dir/file.png"):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.get(url + probe)
+            self.assertEqual(error.exception.code, 404)
+            error.exception.close()
+        # index.html cannot be smuggled in through the file list either
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.publish(files=[{"name": "index.html", "data": ""}])
+        self.assertEqual(error.exception.code, 400)
+        error.exception.close()
+
+    def test_rejects_unsafe_filenames_and_empty_requests(self):
+        # ../evil.png is flattened to its basename (evil.png), never a path
+        with self.publish(files=[{"name": "../evil.png", "data": ""}]) as r:
+            data = json.load(r)
+        self.assertTrue(data["ok"])
+        for name in ("รูปทดสอบ.jpg", "noext", "a" * 100 + ".png"):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.publish(files=[{"name": name, "data": ""}])
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.publish(name="ว่างเปล่า")
+        self.assertEqual(error.exception.code, 400)
+        error.exception.close()
+
+    def test_full_quota_rejects_new_site(self):
+        with mock.patch.object(draw_server, "USER_QUOTA", 64):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.publish(html="<html>" + "x" * 200 + "</html>")
+            self.assertEqual(error.exception.code, 400)
+            self.assertIn("พื้นที่", json.load(error.exception)["error"])
+            error.exception.close()
+
+    def test_storage_summary_counts_sites_and_delete_removes_them(self):
+        request = urllib.request.Request(self.base + "/api/storage", headers=self.auth)
+        with urllib.request.urlopen(request) as response:
+            before = json.load(response)
+        with self.publish(name="โควตา", html="<html>hi</html>") as r:
+            data = json.load(r)
+        with urllib.request.urlopen(request) as response:
+            after = json.load(response)
+        self.assertEqual(after["site_count"], before["site_count"] + 1)
+        self.assertGreater(after["used"], before["used"])
+        self.assertGreaterEqual(after["sites_bytes"], len("<html>hi</html>"))
+
+        root = draw_server.USERS_DIR / "tester" / "sites" / data["id"]
+        self.assertTrue((root / "index.html").is_file())
+        request = urllib.request.Request(self.base + "/api/sites/" + data["id"],
+                                         headers=self.auth, method="DELETE")
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(json.load(response)["removed"], 1)
+        self.assertFalse(root.exists())
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.get(data["url"])
+        self.assertEqual(error.exception.code, 404)
+        error.exception.close()
+
+    def test_publish_requires_login(self):
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            post_json(self.base, "/api/sites", {"html": "<html>x</html>"})
+        self.assertEqual(error.exception.code, 401)
+        error.exception.close()
+
+
 if __name__ == "__main__":
     unittest.main()

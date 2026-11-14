@@ -108,6 +108,11 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
 .msg code{font-family:Consolas,monospace}
 .copy-btn{position:absolute;top:5px;right:5px;padding:3px 9px;border:1px solid #575052;border-radius:7px;background:#1d1d20;color:#d9d3d4;font-size:11px;cursor:pointer;opacity:.8}
 .copy-btn:hover{border-color:#bb5a55;opacity:1}
+.site-btn{position:absolute;top:5px;left:5px;padding:3px 9px;border:1px solid #3f5a46;border-radius:7px;background:#1b241d;color:#a9dcb6;font-size:11px;cursor:pointer;opacity:.9;white-space:nowrap}
+.site-btn:hover{border-color:#7bb889;opacity:1}
+.site-btn:disabled{opacity:.55;cursor:wait}
+.site-link-row{margin:4px 0 8px;font-size:12px;word-break:break-all}
+.site-link-row a{color:#8fd0a0}
 .msg-copy{display:inline-flex;align-items:center;gap:5px;margin-top:9px;padding:3px 10px;border:1px solid #575052;border-radius:7px;background:transparent;color:#b3adb0;font-size:11px;cursor:pointer}
 .msg-copy:hover{border-color:#bb5a55;color:#e5dfd1}
 .msg .tok{display:inline-flex;align-items:center;margin:9px 0 0 8px;color:#8f8a8c;font-size:11px;font-variant-numeric:tabular-nums}
@@ -723,17 +728,19 @@ async function openChat(id){
     const data=await jsonResponse(await authFetch("/api/chats/"+encodeURIComponent(id),{cache:"no-store"}));
     currentChatSession=id;
     chatHistory=data.messages.map(m=>({role:m.role,content:m.content}));
+    siteAssets=[];
     const log=$("chat-log");log.replaceChildren();
     for(const m of chatHistory){
       const div=document.createElement("div");div.className="msg "+m.role;
       div.innerHTML=mdLite(m.content);log.appendChild(div);
     }
+    decorateSiteButtons(log);
     log.scrollTop=log.scrollHeight;setChatStatus("");
     renderChatHistory();
   }catch(error){setChatStatus("เปิดบทสนทนาไม่สำเร็จ: "+error.message,true)}
 }
 function resetChatView(){
-  currentChatSession=null;chatHistory=[];lastUsage=null;
+  currentChatSession=null;chatHistory=[];lastUsage=null;siteAssets=[];
   $("ctx-meter").hidden=true;
   const log=$("chat-log");log.replaceChildren();log.innerHTML=CHAT_EMPTY_HTML;
   renderChatHistory();
@@ -884,6 +891,28 @@ function renderAtts(){
     if(att.kind==="image"){const img=document.createElement("img");img.src=att.dataUrl;chip.appendChild(img)}
     else chip.append("📄 ");
     chip.append(att.name);
+    if(att.kind==="image"){
+      const link=document.createElement("button");link.type="button";
+      link.textContent=att.siteUrl?"🌐":"🔗";
+      link.title=att.siteUrl?"เปิดลิงก์ไฟล์นี้":"สร้างโฟลเดอร์บนเซิร์ฟเวอร์แล้วได้ลิงก์ไฟล์นี้";
+      link.addEventListener("click",async()=>{
+        if(att.siteUrl){window.open(att.siteUrl,"_blank","noopener");return}
+        if(!SITE_FILE_RE.test(att.name)){setChatStatus("สร้างลิงก์ไม่ได้: ชื่อไฟล์ \""+att.name+"\" ต้องเป็นภาษาอังกฤษ ตัวเลข จุด ขีด (เช่น logo.png)",true);return}
+        link.disabled=true;link.textContent="⏳";
+        try{
+          const data=await jsonResponse(await authFetch("/api/sites",{method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({name:att.name,files:[{name:att.name,data:att.dataUrl.split(",",2)[1]}]})}));
+          att.siteUrl=new URL(data.url,location.href).href;
+          addSiteLinkRow(null,att.siteUrl);
+          try{await navigator.clipboard.writeText(att.siteUrl)}catch{}
+          setChatStatus("คัดลอกลิงก์ไฟล์แล้ว: "+att.siteUrl);
+          loadStorage();
+        }catch(err){setChatStatus("สร้างลิงก์ไฟล์ไม่สำเร็จ: "+err.message,true)}
+        renderAtts();
+      });
+      chip.appendChild(link);
+    }
     const x=document.createElement("button");x.type="button";x.textContent="✕";x.title="เอาออก";
     x.addEventListener("click",()=>{chatAtts.splice(i,1);renderAtts()});
     chip.appendChild(x);box.appendChild(chip);
@@ -900,7 +929,10 @@ async function addChatFiles(files){
     try{
       if(isImage){
         if(file.size>15*1024*1024)throw new Error("รูปใหญ่เกิน 15MB");
-        chatAtts.push({kind:"image",name:file.name||"รูปภาพ",dataUrl:await downscaleToJpeg(file,1536)});
+        const dataUrl=await downscaleToJpeg(file,1536);
+        chatAtts.push({kind:"image",name:file.name||"รูปภาพ",dataUrl});
+        siteAssets.push({name:file.name||"image.jpg",dataUrl});
+        if(siteAssets.length>16)siteAssets.shift(); // keep the newest uploads only
       }else{
         if(file.size>10*1024*1024)throw new Error("ไฟล์ใหญ่เกิน 10MB");
         const dataUrl=await readAsDataURL(file);
@@ -931,9 +963,114 @@ function mdLite(text){
   let out="";const parts=text.split("```");
   for(let i=0;i<parts.length;i++){
     if(i%2===0)out+=esc(parts[i]).replace(/`([^`\n]+)`/g,"<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g,"<strong>$1</strong>").replace(/\n/g,"<br>");
-    else out+='<pre><code>'+esc(parts[i].replace(/^\w+\n/,""))+'</code><button type="button" class="copy-btn" title="คัดลองโค้ด">⧉ คัดลอง</button></pre>';
+    else{
+      const nl=parts[i].search(/\n/);
+      const first=(nl<0?parts[i]:parts[i].slice(0,nl)).trim();
+      const lang=/^[a-z0-9+#.-]{1,20}$/i.test(first)?first.toLowerCase():"";
+      const body=lang?(nl<0?"":parts[i].slice(nl+1)):parts[i];
+      const siteBtn=lang==="html"?'<button type="button" class="site-btn" title="สร้างเป็นไฟล์ HTML บนเซิร์ฟเวอร์แล้วเปิดเป็นหน้าเว็บ">🌐 เปิดเป็นหน้าเว็บ</button>':"";
+      out+='<pre><code>'+esc(body)+'</code>'+siteBtn+'<button type="button" class="copy-btn" title="คัดลองโค้ด">⧉ คัดลอง</button></pre>';
+    }
   }
   return out;
+}
+/* ---- publish chat code/files as a real page on the server (/s/<id>/<key>/) ---- */
+let siteAssets=[]; // images uploaded in this chat session, reused when publishing pages
+const SITE_LINK_KEY="thani_site_links";
+let siteLinkCache={};
+try{siteLinkCache=JSON.parse(localStorage.getItem(SITE_LINK_KEY)||"{}")}catch{siteLinkCache={}}
+function siteFingerprint(code){
+  let h1=0xcbf29ce4,h2=0x9e3779b9;
+  for(let i=0;i<code.length;i++){const c=code.charCodeAt(i);
+    h1=Math.imul(h1^c,0x01000193)>>>0;h2=Math.imul(h2^c,0x85ebca6b)>>>0}
+  return h1.toString(36)+"-"+h2.toString(36)+"-"+code.length;
+}
+function rememberSiteLink(fp,url){
+  siteLinkCache[fp]=url;
+  const keys=Object.keys(siteLinkCache);
+  if(keys.length>300)keys.slice(0,keys.length-300).forEach(k=>delete siteLinkCache[k]);
+  try{localStorage.setItem(SITE_LINK_KEY,JSON.stringify(siteLinkCache))}catch{}
+}
+function decorateSiteButtons(root){
+  root.querySelectorAll("pre .site-btn").forEach(btn=>{
+    if(btn.dataset.url)return;
+    const code=btn.closest("pre")?.querySelector("code")?.textContent;
+    if(!code)return;
+    const url=siteLinkCache[siteFingerprint(code)];
+    if(url){btn.dataset.url=url;btn.textContent="🌐 เปิดหน้าเว็บที่สร้างไว้"}
+  });
+}
+const SITE_FILE_RE=/^[A-Za-z0-9._-]{1,80}$/;
+function collectSiteFiles(code){
+  // match images/assets the page references by plain filename and pair them
+  // with what the user uploaded in this chat session
+  const wanted=new Map();
+  const re=/(?:src|href|poster)\s*=\s*["']([^"']+)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi;
+  let m;
+  while((m=re.exec(code))){
+    const raw=(m[1]||m[2]||"").trim();
+    if(!raw||/^(https?:|data:|blob:|#|mailto:|tel:|\/)/i.test(raw))continue;
+    const name=raw.split(/[?#]/)[0].split(/[\\/]/).pop();
+    if(!name||!/\.(png|jpe?g|webp|gif|svg|ico|css|js|json|txt|md|woff2?|mp3|mp4)$/i.test(name))continue;
+    if(!SITE_FILE_RE.test(name))continue;
+    const lower=name.toLowerCase();
+    const hit=siteAssets.find(a=>a.name.toLowerCase()===lower)
+      ||siteAssets.find(a=>a.name.toLowerCase().replace(/\.[^.]+$/,"")===lower.replace(/\.[^.]+$/,""));
+    if(hit&&!wanted.has(lower))wanted.set(lower,{name,data:hit.dataUrl.split(",",2)[1]});
+  }
+  return[...wanted.values()];
+}
+function addSiteLinkRow(pre,url){
+  const abs=new URL(url,location.href).href;
+  if(pre){
+    if(pre.dataset.linked)return abs;
+    pre.dataset.linked=abs;
+    const row=document.createElement("div");row.className="site-link-row";
+    const a=document.createElement("a");a.href=abs;a.target="_blank";a.rel="noopener";a.textContent="🌐 "+abs;
+    row.appendChild(a);pre.after(row);
+  }else{
+    const div=document.createElement("div");div.className="msg assistant";
+    const a=document.createElement("a");a.href=abs;a.target="_blank";a.rel="noopener";a.textContent="🌐 "+abs;
+    div.appendChild(a);$("chat-log").appendChild(div);$("chat-log").scrollTop=$("chat-log").scrollHeight;
+  }
+  return abs;
+}
+async function publishSiteFromPre(pre,open){
+  const code=pre.querySelector("code")?.textContent;
+  if(!code)return null;
+  const btn=pre.querySelector(".site-btn");
+  const fp=siteFingerprint(code);
+  const cached=btn?.dataset.url||siteLinkCache[fp];
+  if(cached){
+    if(btn){btn.dataset.url=cached;btn.textContent="🌐 เปิดหน้าเว็บที่สร้างไว้"}
+    addSiteLinkRow(pre,cached);
+    if(open)window.open(cached,"_blank","noopener");
+    return cached;
+  }
+  if(btn){btn.disabled=true;btn.textContent="⏳ กำลังสร้างไฟล์บนเซิร์ฟเวอร์…"}
+  try{
+    const payload={name:"เว็บไซต์จากแชต",html:code,files:collectSiteFiles(code)};
+    const data=await jsonResponse(await authFetch("/api/sites",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}));
+    rememberSiteLink(fp,data.url);
+    if(btn){btn.disabled=false;btn.dataset.url=data.url;btn.textContent="🌐 เปิดหน้าเว็บที่สร้างไว้"}
+    addSiteLinkRow(pre,data.url);
+    if(open)window.open(data.url,"_blank","noopener");
+    loadStorage();
+    return data.url;
+  }catch(error){
+    if(btn){btn.disabled=false;btn.textContent="🌐 เปิดเป็นหน้าเว็บ"}
+    setChatStatus("สร้างหน้าเว็บไม่สำเร็จ: "+error.message,true);
+    return null;
+  }
+}
+function autoPublishPages(reply){
+  // a finished answer that contains a complete HTML document becomes a real
+  // server file automatically; fragments keep the manual button only
+  reply.querySelectorAll("pre").forEach(pre=>{
+    const code=pre.querySelector("code")?.textContent||"";
+    if(/^\s*(<!doctype\s+html|<html[\s>])/i.test(code))publishSiteFromPre(pre,false);
+  });
 }
 function addBubble(role){
   $("chat-empty")?.remove();
@@ -958,6 +1095,7 @@ function updateCtxMeter(u){
 $("chat-stop").addEventListener("click",()=>chatAbort&&chatAbort.abort());
 $("chat-log").addEventListener("click",async event=>{
   const btn=event.target.closest("button");if(!btn)return;
+  if(btn.classList.contains("site-btn")){publishSiteFromPre(btn.closest("pre"),true);return}
   const isCode=btn.classList.contains("copy-btn"),isMsg=btn.classList.contains("msg-copy");
   if(!isCode&&!isMsg)return;
   const text=isCode?btn.closest("pre").querySelector("code").textContent:btn._raw;
@@ -985,6 +1123,10 @@ $("chat-form").addEventListener("submit",async event=>{
   setChatStatus("");
   const images=chatAtts.filter(a=>a.kind==="image").map(a=>a.dataUrl);
   const docs=chatAtts.filter(a=>a.kind!=="image").map(a=>({name:a.name,data:a.data}));
+  // tell the model the exact attachment names so HTML it writes can reference
+  // them (src="logo.png") and the publish flow can pair them with the uploads
+  const imageNames=chatAtts.filter(a=>a.kind==="image").map(a=>a.name);
+  const sentText=imageNames.length?(text?text+"\n":"")+"(แนบรูป: "+imageNames.join(", ")+")":text;
   const bubble=addBubble("user");
   bubble.textContent=text||"(ดูไฟล์แนบ)";
   for(const att of chatAtts){
@@ -1002,7 +1144,7 @@ $("chat-form").addEventListener("submit",async event=>{
   try{
     const response=await authFetch("/api/chat",{method:"POST",signal:chatAbort.signal,
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({model,messages:[...chatHistory,{role:"user",content:text,images,docs}],chat_session:currentChatSession||undefined,rag:$("rag-toggle").checked||undefined,web:$("web-toggle").checked||undefined})});
+      body:JSON.stringify({model,messages:[...chatHistory,{role:"user",content:sentText,images,docs}],chat_session:currentChatSession||undefined,rag:$("rag-toggle").checked||undefined,web:$("web-toggle").checked||undefined})});
     if(!response.ok||!response.body){const data=await response.json().catch(()=>({}));throw new Error(data.error||"ส่งข้อความไม่สำเร็จ")}
     const reader=response.body.getReader(),decoder=new TextDecoder();
     let buffer="";
@@ -1029,6 +1171,7 @@ $("chat-form").addEventListener("submit",async event=>{
           reply.innerHTML=notesHtml()+mdLite(full);
           if(full){const cp=document.createElement("button");cp.type="button";cp.className="msg-copy";cp.textContent="⧉ คัดลอกข้อความ";cp._raw=full;reply.appendChild(cp);
             if(lastUsage&&typeof lastUsage.eval==="number"){const tok=document.createElement("span");tok.className="tok";tok.textContent="▲ "+fmtTok(lastUsage.eval)+" tokens";reply.appendChild(tok)}}
+          autoPublishPages(reply);
           chatHistory.push({role:"user",content:userContent||text||"(ดูไฟล์แนบ)"},{role:"assistant",content:full});userContent=null
         }
         if(chunk.error)throw new Error(chunk.error);

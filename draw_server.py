@@ -96,6 +96,17 @@ def _parse_ctx_overrides(raw):
 
 CHAT_NUM_CTX_OVERRIDES = _parse_ctx_overrides(
     os.environ.get("CHAT_NUM_CTX_OVERRIDES", ""))
+# Published chat web pages: html + website assets the AI/code block refers to.
+# Served from /s/<id>/<key>/ without login; the random key is the only gate,
+# so links can be shared outside the app.
+SITE_MAX_BODY = 40 * 1024 * 1024  # base64 of html + files in one request
+SITE_MAX_HTML = 2 * 1024 * 1024
+SITE_MAX_FILE = 15 * 1024 * 1024
+SITE_MAX_FILES = 12
+SITE_FILE_EXTS = {
+    "png", "jpg", "jpeg", "webp", "gif", "svg", "ico",
+    "css", "js", "json", "txt", "md", "woff", "woff2",
+}
 WARMUP_TIMEOUT = 300
 PDF_PAGES_MAX = int(os.environ.get("CHAT_PDF_PAGES", "6"))
 SHEET_ROWS_MAX = int(os.environ.get("CHAT_SHEET_ROWS", "400"))
@@ -252,6 +263,16 @@ CREATE TABLE IF NOT EXISTS doc_chunks(
   text TEXT NOT NULL,
   PRIMARY KEY(doc_id, idx)
 );
+CREATE TABLE IF NOT EXISTS sites(
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  dir TEXT NOT NULL,
+  key TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sites_user ON sites(user_id);
 """
 
 
@@ -391,14 +412,15 @@ def session_valid(token):
 
 
 def used_bytes(user_id):
-    """Storage the user's library takes: media, knowledge docs and chat text."""
+    """Storage the user's library takes: media, knowledge docs, sites and chat text."""
     with db() as conn:
         row = conn.execute(
             "SELECT (SELECT COALESCE(SUM(bytes),0) FROM media WHERE user_id=?)"
             " + (SELECT COALESCE(SUM(bytes),0) FROM documents WHERE user_id=?)"
+            " + (SELECT COALESCE(SUM(bytes),0) FROM sites WHERE user_id=?)"
             " + (SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))),0)"
             "    FROM chat_messages WHERE user_id=?) AS used",
-            (user_id, user_id, user_id)).fetchone()
+            (user_id, user_id, user_id, user_id)).fetchone()
     return int(row["used"])
 
 
@@ -417,11 +439,16 @@ def storage_summary(user_id):
             "SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))),0) AS bytes,"
             " COUNT(*) AS messages FROM chat_messages WHERE user_id=?",
             (user_id,)).fetchone()
-    used = int(row["images"]) + int(row["music"]) + int(docs["bytes"]) + int(chat["bytes"])
+        sites = conn.execute(
+            "SELECT COALESCE(SUM(bytes),0) AS bytes, COUNT(*) AS count"
+            " FROM sites WHERE user_id=?", (user_id,)).fetchone()
+    used = int(row["images"]) + int(row["music"]) + int(docs["bytes"]) \
+        + int(chat["bytes"]) + int(sites["bytes"])
     return {"quota": USER_QUOTA, "used": used, "remaining": max(0, USER_QUOTA - used),
             "images_bytes": int(row["images"]), "music_bytes": int(row["music"]),
             "docs_bytes": int(docs["bytes"]), "doc_count": int(docs["count"]),
             "chats_bytes": int(chat["bytes"]),
+            "sites_bytes": int(sites["bytes"]), "site_count": int(sites["count"]),
             "image_count": int(row["image_count"]), "music_count": int(row["music_count"]),
             "chat_messages": int(chat["messages"])}
 
@@ -514,6 +541,169 @@ def delete_media(user_id, media_id=None, kind=None):
             target.unlink()
         except OSError:
             pass
+    return len(rows)
+
+
+def sniff_image_type(data):
+    """Content-type from magic bytes; browsers must not trust the stored name
+    (chat uploads are re-encoded to JPEG whatever the filename says)."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return None
+
+
+def site_mime(name, data=b""):
+    sniffed = sniff_image_type(data)
+    if sniffed:
+        return sniffed
+    return {
+        ".html": "text/html; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".js": "text/javascript; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8",
+        ".svg": "image/svg+xml", ".ico": "image/x-icon",
+        ".woff": "font/woff", ".woff2": "font/woff2",
+    }.get(Path(name).suffix.lower(), "application/octet-stream")
+
+
+SITE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+def safe_site_filename(name):
+    """Flatten one uploaded asset name: single path segment, known extension."""
+    name = str(name or "").strip().replace("\\", "/").split("/")[-1]
+    if not SITE_NAME_RE.match(name) or name.startswith("."):
+        return None
+    if Path(name).suffix.lower().lstrip(".") not in SITE_FILE_EXTS:
+        return None
+    return name
+
+
+def site_gallery_index(name, filenames):
+    """Minimal Thai landing page shown at the site root when the request
+    carries only files (e.g. a chat attachment promoted to a shareable link)."""
+    def esc(text):
+        return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+    cards = []
+    for fn in filenames:
+        if Path(fn).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp",
+                                       ".gif", ".svg", ".ico"):
+            cards.append(
+                '<figure><a href="{0}" target="_blank"><img src="{0}" alt="{0}"'
+                ' loading="lazy"></a><figcaption>{0}</figcaption></figure>'
+                .format(esc(fn)))
+        else:
+            cards.append('<p class="file">📄 <a href="{0}" download>{0}</a></p>'
+                         .format(esc(fn)))
+    title = esc(name or "ไฟล์จากแชต")
+    return f"""<!DOCTYPE html>
+<html lang="th"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>body{{margin:0;padding:24px;background:#141416;color:#e8dfe0;
+font-family:'Leelawadee UI','Noto Sans Thai',sans-serif}}
+h1{{font-size:20px;margin:0 0 18px}}
+figure{{margin:0 0 18px;display:inline-block;vertical-align:top;margin-right:14px}}
+img{{max-width:min(320px,90vw);max-height:260px;border-radius:10px;
+border:1px solid #3a3436;display:block;background:#0d0d0f}}
+figcaption{{font-size:12px;margin-top:6px;color:#b7aeb0;word-break:break-all}}
+.file a{{color:#e8a49e}}</style></head><body>
+<h1>📂 {title}</h1>
+{''.join(cards) or '<p>ไม่มีไฟล์</p>'}
+</body></html>"""
+
+
+def create_site(user, name, html, files):
+    """Write one published page folder users/<username>/sites/<id>/.
+
+    html is optional; without it the root shows a gallery of the files.
+    files = [{"name": "logo.png", "data": "<base64>"}]. Returns the new row's
+    fields, raising ValueError with a Thai message on bad input or full quota.
+    """
+    user_id, username = user
+    if html is not None and not isinstance(html, str):
+        raise ValueError("html ไม่ถูกต้อง")
+    if html is not None and len(html.encode("utf-8")) > SITE_MAX_HTML:
+        raise ValueError("โค้ด HTML ยาวเกิน 2MB")
+    files = files or []
+    if not isinstance(files, list) or len(files) > SITE_MAX_FILES:
+        raise ValueError(f"แนบไฟล์ได้สูงสุด {SITE_MAX_FILES} ไฟล์ต่อหน้าเว็บ")
+    prepared, total = [], 0
+    seen = set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("ไฟล์แนบไม่ถูกต้อง")
+        fname = safe_site_filename(item.get("name"))
+        data = item.get("data")
+        if not fname:
+            raise ValueError(f"ชื่อไฟล์ไม่รองรับ: {item.get('name')!r}")
+        if fname.lower() == "index.html":
+            raise ValueError("index.html สงวนไว้สำหรับหน้าเว็บของระบบ")
+        if fname.lower() in seen:
+            continue
+        if not isinstance(data, str):
+            raise ValueError(f"ไฟล์ {fname} ไม่มีข้อมูล")
+        try:
+            raw = base64.b64decode(data, validate=False)
+        except (binascii.Error, ValueError):
+            raise ValueError(f"ไฟล์ {fname} เสียหาย อ่านข้อมูลไม่ได้")
+        if len(raw) > SITE_MAX_FILE:
+            raise ValueError(f"ไฟล์ {fname} ใหญ่เกิน 15MB")
+        seen.add(fname.lower())
+        prepared.append((fname, raw))
+        total += len(raw)
+    if html is None and not prepared:
+        raise ValueError("ต้องแนบโค้ด HTML หรือไฟล้อย่างน้อยหนึ่งอย่าง")
+    site_id = uuid.uuid4().hex[:12]
+    page = html if html is not None else site_gallery_index(name, [f for f, _ in prepared])
+    total += len(page.encode("utf-8"))
+    if used_bytes(user_id) + total > USER_QUOTA:
+        raise ValueError("พื้นที่เก็บข้อมูลเต็ม ลบไฟล์เก่าในคลังก่อนแล้วลองใหม่")
+    rel_dir = f"{username}/sites/{site_id}"
+    site_dir = USERS_DIR / username / "sites" / site_id
+    site_dir.mkdir(parents=True, exist_ok=True)
+    (site_dir / "index.html").write_text(page, encoding="utf-8")
+    for fname, raw in prepared:
+        (site_dir / fname).write_bytes(raw)
+    site_key = uuid.uuid4().hex[:16]
+    with DB_LOCK, db() as conn:
+        conn.execute(
+            "INSERT INTO sites(id, user_id, name, dir, key, bytes, created_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (site_id, user_id, (str(name or "").strip() or "เว็บไซต์จากแชต")[:80],
+             rel_dir, site_key, total, time.time()))
+    return {"id": site_id, "name": name or "เว็บไซต์จากแชต", "key": site_key,
+            "url": f"/s/{site_id}/{site_key}/", "bytes": total}
+
+
+def get_site(site_id, site_key):
+    """Fetch a published site row only when both id and key match."""
+    with db() as conn:
+        return conn.execute("SELECT * FROM sites WHERE id=? AND key=?",
+                            (site_id, site_key)).fetchone()
+
+
+def delete_site(user_id, site_id=None):
+    """Remove one published site (or all of the user's sites) plus its folder."""
+    with DB_LOCK, db() as conn:
+        if site_id is not None:
+            rows = conn.execute("SELECT * FROM sites WHERE user_id=? AND id=?",
+                                (user_id, site_id)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM sites WHERE user_id=?",
+                                (user_id,)).fetchall()
+        for row in rows:
+            conn.execute("DELETE FROM sites WHERE id=?", (row["id"],))
+    for row in rows:
+        shutil.rmtree(DATA_DIR / "users" / row["dir"], ignore_errors=True)
     return len(rows)
 
 
@@ -2295,6 +2485,8 @@ class Handler(BaseHTTPRequestHandler):
         elif route in ("/approve", "/approve.html"):
             html = (HERE / "approve.html").read_text(encoding="utf-8")
             self._send(200, html, "text/html; charset=utf-8", cache="no-cache")
+        elif route.startswith("/s/"):
+            self._serve_site(route)
         elif route == "/api/session":
             info = self._session()
             if not info:
@@ -2435,6 +2627,57 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
 
+    def _serve_site(self, route):
+        """Serve a published chat page at /s/<id>/<key>/ without a login:
+        the random key in the link is the access gate."""
+        parts = route.split("/")
+        if len(parts) == 5 and parts[4] == "":
+            parts.pop()
+        if len(parts) not in (4, 5):
+            self._send(404, {"error": "not found"})
+            return
+        row = get_site(parts[2], parts[3])
+        if row is None:
+            self._send(404, {"error": "ไม่พบหน้าเว็บนี้"})
+            return
+        fname = urllib.parse.unquote(parts[4]) if len(parts) == 5 else "index.html"
+        if not SITE_NAME_RE.match(fname) or fname.startswith(".") \
+                or Path(fname).suffix.lower().lstrip(".") not in ({"html"} | SITE_FILE_EXTS):
+            self._send(404, {"error": "ไม่พบไฟล์นี้"})
+            return
+        site_root = (DATA_DIR / "users" / row["dir"]).resolve()
+        target = (site_root / fname).resolve()
+        if not str(target).startswith(str(site_root) + os.sep) or not target.is_file():
+            self._send(404, {"error": "ไม่พบไฟล์นี้"})
+            return
+        data = target.read_bytes()
+        self._send(200, data, site_mime(fname, data[:16]), cache="no-cache")
+
+    def _handle_site_create(self):
+        """Publish one chat HTML page (plus its assets) as real files on the
+        server and hand back a shareable link."""
+        user = self._current_user()
+        if not user:
+            self._send(403, {"error": "บัญชีนี้ใช้งานห้องแชตเท่านั้น"})
+            return
+        body = self._read_json(SITE_MAX_BODY)
+        if body is None:
+            return
+        name = body.get("name")
+        if name is not None and (not isinstance(name, str) or not name.strip()
+                                 or len(name) > 80):
+            self._send(400, {"error": "ชื่อไม่ถูกต้อง (1-80 ตัวอักษร)"})
+            return
+        try:
+            site = create_site((user["id"], user["username"]), name,
+                               body.get("html"), body.get("files"))
+        except ValueError as e:
+            self._send(400, {"error": str(e)})
+            return
+        self._send(200, {"ok": True, "id": site["id"], "name": site["name"],
+                         "url": site["url"], "bytes": site["bytes"],
+                         "storage": storage_summary(user["id"])})
+
     def do_POST(self):
         route = self.path.split("?", 1)[0]
         if route == "/api/login":
@@ -2469,6 +2712,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/docs":
             self._handle_docs_upload()
+            return
+        if route == "/api/sites":
+            self._handle_site_create()
             return
         if route != "/api/generate":
             self._send(404, {"error": "not found"})
@@ -2877,6 +3123,12 @@ class Handler(BaseHTTPRequestHandler):
             did = route.rsplit("/", 1)[-1]
             if not did.isdigit() or not delete_document(user["id"], int(did)):
                 self._send(404, {"error": "ไม่พบไฟล์นี้"})
+                return
+            self._send(200, {"removed": 1})
+        elif route.startswith("/api/sites/"):
+            sid = route.rsplit("/", 1)[-1]
+            if not delete_site(user["id"], sid):
+                self._send(404, {"error": "ไม่พบหน้าเว็บนี้"})
                 return
             self._send(200, {"removed": 1})
         else:
