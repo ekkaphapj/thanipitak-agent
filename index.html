@@ -897,12 +897,11 @@ function renderAtts(){
       link.title=att.siteUrl?"เปิดลิงก์ไฟล์นี้":"สร้างโฟลเดอร์บนเซิร์ฟเวอร์แล้วได้ลิงก์ไฟล์นี้";
       link.addEventListener("click",async()=>{
         if(att.siteUrl){window.open(att.siteUrl,"_blank","noopener");return}
-        if(!SITE_FILE_RE.test(att.name)){setChatStatus("สร้างลิงก์ไม่ได้: ชื่อไฟล์ \""+att.name+"\" ต้องเป็นภาษาอังกฤษ ตัวเลข จุด ขีด (เช่น logo.png)",true);return}
         link.disabled=true;link.textContent="⏳";
         try{
           const data=await jsonResponse(await authFetch("/api/sites",{method:"POST",
             headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({name:att.name,files:[{name:att.name,data:att.dataUrl.split(",",2)[1]}]})}));
+            body:JSON.stringify({name:att.assetName,files:[{name:att.assetName,data:att.dataUrl.split(",",2)[1]}]})}));
           att.siteUrl=new URL(data.url,location.href).href;
           addSiteLinkRow(null,att.siteUrl);
           try{await navigator.clipboard.writeText(att.siteUrl)}catch{}
@@ -930,8 +929,9 @@ async function addChatFiles(files){
       if(isImage){
         if(file.size>15*1024*1024)throw new Error("รูปใหญ่เกิน 15MB");
         const dataUrl=await downscaleToJpeg(file,1536);
-        chatAtts.push({kind:"image",name:file.name||"รูปภาพ",dataUrl});
-        siteAssets.push({name:file.name||"image.jpg",dataUrl});
+        const assetName=safeAssetName(file.name,assetSeq++);
+        chatAtts.push({kind:"image",name:file.name||"รูปภาพ",assetName,dataUrl});
+        siteAssets.push({name:assetName,dataUrl});
         if(siteAssets.length>16)siteAssets.shift(); // keep the newest uploads only
       }else{
         if(file.size>10*1024*1024)throw new Error("ไฟล์ใหญ่เกิน 10MB");
@@ -976,6 +976,7 @@ function mdLite(text){
 }
 /* ---- publish chat code/files as a real page on the server (/s/<id>/<key>/) ---- */
 let siteAssets=[]; // images uploaded in this chat session, reused when publishing pages
+let assetSeq=0; // counter for renamed (Thai/unusual) filenames
 const SITE_LINK_KEY="thani_site_links";
 let siteLinkCache={};
 try{siteLinkCache=JSON.parse(localStorage.getItem(SITE_LINK_KEY)||"{}")}catch{siteLinkCache={}}
@@ -1001,10 +1002,20 @@ function decorateSiteButtons(root){
   });
 }
 const SITE_FILE_RE=/^[A-Za-z0-9._-]{1,80}$/;
+function safeAssetName(name,idx){
+  // the publish server only accepts ascii filenames; Thai/unusual names get a
+  // generated one so the whole attach→write html→publish flow keeps working
+  let n=String(name||"").trim().replace(/\\/g,"/").split("/").pop();
+  if(SITE_FILE_RE.test(n)&&/\.(png|jpe?g|webp|gif|svg|ico)$/i.test(n))return n;
+  const ext=(n.match(/\.(png|jpe?g|webp|gif)$/i)||[])[1];
+  return "image-"+(idx+1)+(ext?"."+ext.toLowerCase():".jpg");
+}
 function collectSiteFiles(code){
-  // match images/assets the page references by plain filename and pair them
-  // with what the user uploaded in this chat session
-  const wanted=new Map();
+  // pair local src/href references with images uploaded in this chat session:
+  // exact name first, then basename ignoring the extension, and finally — for
+  // names the model invented — leftover uploads in order, saved under the name
+  // the HTML references so the published page just works
+  const wanted=new Map(),used=new Set(),refs=[];
   const re=/(?:src|href|poster)\s*=\s*["']([^"']+)["']|url\(\s*["']?([^"')]+)["']?\s*\)/gi;
   let m;
   while((m=re.exec(code))){
@@ -1013,10 +1024,23 @@ function collectSiteFiles(code){
     const name=raw.split(/[?#]/)[0].split(/[\\/]/).pop();
     if(!name||!/\.(png|jpe?g|webp|gif|svg|ico|css|js|json|txt|md|woff2?|mp3|mp4)$/i.test(name))continue;
     if(!SITE_FILE_RE.test(name))continue;
-    const lower=name.toLowerCase();
-    const hit=siteAssets.find(a=>a.name.toLowerCase()===lower)
-      ||siteAssets.find(a=>a.name.toLowerCase().replace(/\.[^.]+$/,"")===lower.replace(/\.[^.]+$/,""));
-    if(hit&&!wanted.has(lower))wanted.set(lower,{name,data:hit.dataUrl.split(",",2)[1]});
+    if(!refs.some(r=>r.toLowerCase()===name.toLowerCase()))refs.push(name);
+  }
+  const add=(refName,asset)=>{
+    wanted.set(refName.toLowerCase(),{name:refName,data:asset.dataUrl.split(",",2)[1]});
+  };
+  for(const name of refs){
+    const lower=name.toLowerCase(),base=lower.replace(/\.[^.]+$/,"");
+    const asset=siteAssets.find(a=>!used.has(a)&&a.name.toLowerCase()===lower)
+      ||siteAssets.find(a=>!used.has(a)&&a.name.toLowerCase().replace(/\.[^.]+$/,"")===base);
+    if(asset){used.add(asset);add(name,asset)}
+  }
+  for(const name of refs){
+    if(wanted.has(name.toLowerCase()))continue;
+    if(!/\.(png|jpe?g|webp|gif|svg|ico)$/i.test(name))continue; // uploads are images
+    const free=siteAssets.find(a=>!used.has(a));
+    if(!free)break;
+    used.add(free);add(name,free);
   }
   return[...wanted.values()];
 }
@@ -1125,8 +1149,11 @@ $("chat-form").addEventListener("submit",async event=>{
   const docs=chatAtts.filter(a=>a.kind!=="image").map(a=>({name:a.name,data:a.data}));
   // tell the model the exact attachment names so HTML it writes can reference
   // them (src="logo.png") and the publish flow can pair them with the uploads
-  const imageNames=chatAtts.filter(a=>a.kind==="image").map(a=>a.name);
-  const sentText=imageNames.length?(text?text+"\n":"")+"(แนบรูป: "+imageNames.join(", ")+")":text;
+  const imageNames=chatAtts.filter(a=>a.kind==="image").map(a=>a.assetName||a.name);
+  const sentText=imageNames.length?(text?text+"\n":"")
+    +"(แนบรูป "+imageNames.length+" ไฟล์: "+imageNames.join(", ")
+    +" — ถ้าเขียนหน้าเว็บ/HTML ให้แทรกรูปพวกนี้ด้วยชื่อไฟล์เดิมเป๊ะ ๆ เช่น <img src=\""
+    +imageNames[0]+"\"> ห้ามเปลี่ยนชื่อ ห้ามใช้ placeholder หรือลิงก์อื่นแทนรูปที่แนบมา)":text;
   const bubble=addBubble("user");
   bubble.textContent=text||"(ดูไฟล์แนบ)";
   for(const att of chatAtts){
