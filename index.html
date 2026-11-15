@@ -108,9 +108,9 @@ summary{width:fit-content;cursor:pointer;color:#e0dcdd;font-size:14px;font-weigh
 .msg code{font-family:Consolas,monospace}
 .copy-btn{position:absolute;top:5px;right:5px;padding:3px 9px;border:1px solid #575052;border-radius:7px;background:#1d1d20;color:#d9d3d4;font-size:11px;cursor:pointer;opacity:.8}
 .copy-btn:hover{border-color:#bb5a55;opacity:1}
-.site-btn{position:absolute;top:5px;left:5px;padding:3px 9px;border:1px solid #3f5a46;border-radius:7px;background:#1b241d;color:#a9dcb6;font-size:11px;cursor:pointer;opacity:.9;white-space:nowrap}
-.site-btn:hover{border-color:#7bb889;opacity:1}
-.site-btn:disabled{opacity:.55;cursor:wait}
+.site-btn,.verify-btn{position:absolute;top:5px;left:5px;padding:3px 9px;border:1px solid #3f5a46;border-radius:7px;background:#1b241d;color:#a9dcb6;font-size:11px;cursor:pointer;opacity:.9;white-space:nowrap}
+.site-btn:hover,.verify-btn:hover{border-color:#7bb889;opacity:1}
+.site-btn:disabled,.verify-btn:disabled{opacity:.55;cursor:wait}
 .site-link-row{margin:4px 0 8px;font-size:12px;word-break:break-all}
 .site-link-row a{color:#8fd0a0}
 .msg-copy{display:inline-flex;align-items:center;gap:5px;margin-top:9px;padding:3px 10px;border:1px solid #575052;border-radius:7px;background:transparent;color:#b3adb0;font-size:11px;cursor:pointer}
@@ -961,22 +961,30 @@ document.addEventListener("paste",async event=>{
   await addChatFiles(images.map((f,i)=>new File([f],(f.name&&f.name!=="image.png"?f.name:`screenshot-${stamp}${images.length>1?"-"+(i+1):""}.png`),{type:f.type})));
   $("chat-input").focus();
 });
+const CODE_LANGUAGES=new Map([
+  ["python","python"],["python3","python"],["py","python"],
+  ["javascript","javascript"],["js","javascript"],["mjs","javascript"],["cjs","cjs"],
+  ["json","json"],["bash","bash"],["sh","sh"]
+]);
 function mdLite(text){
   const esc=s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  const codeBlock=(body,lang)=>{
+  const codeBlock=(body,lang,filename="",closed=true)=>{
     const siteBtn=lang==="html"?'<button type="button" class="site-btn" title="ตรวจหน้าเว็บก่อนสร้างลิงก์">🌐 เปิดเป็นหน้าเว็บ</button>':"";
-    return '<pre><code>'+esc(body)+'</code>'+siteBtn+'<button type="button" class="copy-btn" title="คัดลองโค้ด">⧉ คัดลอง</button></pre>';
+    const verifyBtn=CODE_LANGUAGES.has(lang)?'<button type="button" class="verify-btn">ตรวจไวยากรณ์</button>':"";
+    return '<pre data-language="'+lang+'" data-file="'+filename+'" data-closed="'+closed+'"><code>'+esc(body)+'</code>'+
+      siteBtn+verifyBtn+'<button type="button" class="copy-btn" title="คัดลองโค้ด">⧉ คัดลอง</button></pre>';
   };
   if(isSiteDocument(text))return codeBlock(text,"html");
-  let out="";const parts=text.split("```");
+  let out="";const parts=text.split(/^[ \t]{0,3}\x60{3}(?!\x60)/m);
   for(let i=0;i<parts.length;i++){
     if(i%2===0)out+=esc(parts[i]).replace(/`([^`\n]+)`/g,"<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g,"<strong>$1</strong>").replace(/\n/g,"<br>");
     else{
       const nl=parts[i].search(/\n/);
       const first=(nl<0?parts[i]:parts[i].slice(0,nl)).trim();
-      const lang=/^[a-z0-9+#.-]{1,20}$/i.test(first)?first.toLowerCase():"";
+      const header=first.match(/^([a-z0-9+#.-]{1,20})(?:\s+([a-z0-9_./-]{1,100}))?$/i);
+      const lang=header?.[1].toLowerCase()||"";
       const body=lang?(nl<0?"":parts[i].slice(nl+1)):parts[i];
-      out+=codeBlock(body,lang);
+      out+=codeBlock(body,lang,header?.[2],i<parts.length-1);
     }
   }
   return out;
@@ -1093,7 +1101,7 @@ async function publishSiteFromPre(pre,open,files,signal){
       }
       if(open){
         setChatStatus("กำลังเปิดและตรวจหน้าเว็บในเบราว์เซอร์…");
-        const {errors}=await previewSite(code,files,signal);
+        const {errors}=await previewSite(code,files,signal,pre.dataset.threeMode,pre.dataset.interactionRequired==="true");
         if(errors.length)throw new Error(errors.join(" · "));
         setChatStatus("");
       }
@@ -1118,14 +1126,60 @@ async function publishSiteFromPre(pre,open,files,signal){
   }
 }
 const SITE_REPAIR_LIMIT=2;
+const SITE_THREE_BUILD="https://cdn.jsdelivr.net/npm/three@0.180.0/build/";
+const SITE_THREE_MODULE=SITE_THREE_BUILD+"three.module.min.js";
+const SITE_THREE_CORE=SITE_THREE_BUILD+"three.core.min.js";
+
+function asksToWriteCode(text){
+  return /(เขียน|สร้าง|ออกแบบ|แก้|ปรับ|ทำ(?:หน้าเว็บ|เว็บ|เมือง|โปรแกรม|สคริปต์|ระบบ|โค้ด)|\b(write|make|build|create|generate|fix|implement|refactor)\b)/i.test(text);
+}
+function threeSiteMode(text){
+  if(!/\bthree\s*\.\s*js\b/i.test(text)||!asksToWriteCode(text))return "";
+  return /(เมือง|\bcity\b|cityscape)/i.test(text)?"city":"three";
+}
+function threeSiteBrief(mode){
+  if(!mode)return "";
+  return "ส่ง HTML ฉบับเต็มที่ปิด </html> ในบล็อก html เดียว เขียนให้กระชับและเก็บ CSS/JS ในไฟล์เดียว "
+    +"ใช้ <script type=\"module\"> และ import * as THREE from '"+SITE_THREE_MODULE+"'; "
+    +"ใช้ THREE.WebGLRenderer ให้เห็นฉากตั้งแต่เฟรมแรก ห้ามเปลี่ยนไปใช้ Canvas 2D "
+    +"ใช้โมดูล Three.js จาก URL นี้เท่านั้น เขียนส่วนควบคุมในไฟล์เดียว และรองรับ resize "
+    +(mode==="city"?"สำหรับเมืองแบบง่าย ใช้ผัง 4×4 เว้นแต่ผู้ใช้กำหนดผังอื่น หนึ่งตึกต่อช่องอ้างตำแหน่งจาก row/col โดยตรง เช่น x=(col-1.5)*6 และ z=(row-1.5)*6 "
+      +"ใช้ BoxGeometry(3.5, h, 3.5) กับ position.y=h/2 ให้ฐานแตะพื้น y=0 และให้ความสูง h ต่างกัน มีถนนต่อเนื่องระหว่างช่อง "
+      +"ให้กล้อง perspective มองเฉียงลงเห็นขอบตึกครบทุกหลังโดยเหลือพื้นที่รอบเมือง มีแสงกลางวัน "
+      +"ลากเมาส์หรือสัมผัสเพื่อหมุนเฉพาะกล้อง และเลื่อนล้อเพื่อซูม "
+      +"เพิ่ม window.siteCityPreview = {camera, buildings}; โดย buildings เป็น array ของ Three.js Mesh ตึกจริง ":"");
+}
+function browserTestBrief(text,threeMode){
+  if(threeMode||!asksToWriteCode(text)||!/(เว็บ|html|dashboard|web app|website)/i.test(text)||
+    !/(interactive|โต้ตอบ|แบบฟอร์ม|คำนวณ|ตะกร้า|เครื่องมือ|กดปุ่ม|click)/i.test(text))return "";
+  return 'ใส่กรณีทดสอบการใช้งาน 1–3 กรณีใน <script type="application/json" id="site-smoke-tests"> '
+    +'เป็น JSON array เช่น [{"click":"#increment","expect":{"selector":"#result","text":"1"}}] '
+    +'หรือใช้ "fill":{"selector":"#amount","value":"10"} ก่อน click แต่ละกรณีต้องตรวจค่าที่เปลี่ยนจริงจากการใช้งาน';
+}
 
 // Runs inside the sandbox before any generated JavaScript.
-function sitePreviewProbe(nonce){
+function sitePreviewProbe(nonce,threeModule,city,needsInteraction){
   document.currentScript.remove();
   const send=parent.postMessage.bind(parent);
   const errors=new Set();
   const describe=value=>String(value||"ไม่ทราบสาเหตุ").replace(/data:[^\s"')]+/g,"[data URL]").slice(0,240);
   const record=message=>{if(errors.size<8)errors.add(message)};
+  const webglDraws=new Map();
+  if(threeModule){
+    for(const renderer of [window.WebGLRenderingContext,window.WebGL2RenderingContext]){
+      const prototype=renderer?.prototype;
+      for(const method of ["drawArrays","drawElements","drawArraysInstanced","drawElementsInstanced"]){
+        const draw=prototype?.[method];
+        if(typeof draw!=="function")continue;
+        prototype[method]=function(...args){
+          const result=Reflect.apply(draw,this,args);
+          const count=method.startsWith("drawArrays")?args[2]:args[1];
+          if(count>0)webglDraws.set(this.canvas,(webglDraws.get(this.canvas)||0)+1);
+          return result;
+        };
+      }
+    }
+  }
   window.addEventListener("error",event=>{
     if(event instanceof ErrorEvent){
       record("JavaScript: "+describe(event.message));
@@ -1138,7 +1192,96 @@ function sitePreviewProbe(nonce){
   window.addEventListener("securitypolicyviolation",event=>{
     record("เบราว์เซอร์บล็อก "+event.violatedDirective+": "+describe(event.blockedURI));
   });
-  window.addEventListener("load",()=>setTimeout(()=>{
+  function checkCity(){
+    const {camera,buildings}=window.siteCityPreview||{};
+    if(!camera?.isPerspectiveCamera||!Array.isArray(buildings)||!buildings.length||
+      buildings.length>256||!buildings.every(mesh=>mesh?.isMesh&&mesh.geometry)){
+      record("ยังตรวจผังเมืองไม่ได้ ต้องส่ง camera และ array ของ Mesh ตึกจริงผ่าน window.siteCityPreview");
+      return "";
+    }
+    try{
+      camera.updateMatrixWorld();
+      const boxes=buildings.map(mesh=>{
+        mesh.updateWorldMatrix(true,false);
+        mesh.geometry.computeBoundingBox();
+        return mesh.geometry.boundingBox.clone().applyMatrix4(mesh.matrixWorld);
+      });
+      if(boxes.some(box=>!Number.isFinite(box.min.y)||Math.abs(box.min.y)>0.15||box.max.y<=box.min.y))
+        record("มีตึกที่ฐานลอยหรือจมพื้น y=0 หรือตึกสูงเป็นศูนย์");
+      if(boxes.some((box,i)=>boxes.slice(i+1).some(other=>
+        Math.min(box.max.x,other.max.x)-Math.max(box.min.x,other.min.x)>-0.2&&
+        Math.min(box.max.z,other.max.z)-Math.max(box.min.z,other.min.z)>-0.2)))
+        record("ตึกบางหลังซ้อนกันหรืออยู่ชิดเกินกว่าจะมีช่องถนน คำนวณตำแหน่งแยกตามแถวและคอลัมน์");
+      const corner=camera.position.clone();
+      const outside=boxes.filter(({min,max})=>
+        [min.x,max.x].some(x=>[min.y,max.y].some(y=>[min.z,max.z].some(z=>{
+          corner.set(x,y,z).project(camera);
+          return ![corner.x,corner.y,corner.z].every(Number.isFinite)||
+            Math.abs(corner.x)>0.98||Math.abs(corner.y)>0.98||Math.abs(corner.z)>1;
+        })))
+      ).length;
+      if(outside)record("ตึก "+outside+" หลังหลุดขอบภาพตอนเปิดหน้า ปรับระยะและจุดเล็งของกล้องให้เห็นทั้งเมือง");
+      return "ตึก "+boxes.length+" หลัง · ตึกหลุดขอบภาพ "+outside+" หลัง";
+    }catch(error){
+      record("อ่านตำแหน่งตึกจากฉาก Three.js ไม่สำเร็จ: "+describe(error.message));
+      return "";
+    }
+  }
+  async function checkInteractions(){
+    const suite=document.getElementById("site-smoke-tests");
+    if(!suite){
+      if(needsInteraction)record("ยังไม่มีกรณีทดสอบการโต้ตอบ site-smoke-tests");
+      return 0;
+    }
+    let tests;
+    try{tests=JSON.parse(suite.textContent)}catch{record("กรณีทดสอบการโต้ตอบต้องเป็น JSON ที่ถูกต้อง");return 0}
+    if(!Array.isArray(tests)||!tests.length||tests.length>5){
+      record("กรณีทดสอบการโต้ตอบต้องเป็นรายการ 1–5 กรณี");
+      return 0;
+    }
+    const select=selector=>{
+      if(typeof selector!=="string"||selector.length>120)throw new Error("selector ไม่ถูกต้อง");
+      const element=document.querySelector(selector);
+      if(!element)throw new Error("ไม่พบองค์ประกอบ "+selector);
+      return element;
+    };
+    const read=expect=>{
+      const element=select(expect.selector);
+      return ("value" in element?String(element.value):element.textContent).trim();
+    };
+    let passed=0;
+    for(const [index,test] of tests.entries()){
+      try{
+        if(!test?.expect||typeof test.expect.text!=="string"||test.expect.text.length>240||
+          (!test.fill&&!test.click))throw new Error("ต้องระบุการกรอกหรือกด และค่าที่คาดหวัง");
+        const previous=read(test.expect);
+        if(test.fill){
+          const input=select(test.fill.selector);
+          if(!input.matches("input:not([type=file]),textarea,select")||input.disabled||
+            typeof test.fill.value!=="string"||test.fill.value.length>240)throw new Error("ช่องกรอกหรือค่าไม่ถูกต้อง");
+          input.value=test.fill.value;
+          input.dispatchEvent(new Event("input",{bubbles:true}));
+          input.dispatchEvent(new Event("change",{bubbles:true}));
+        }
+        if(test.click){
+          const button=select(test.click);
+          if(!button.matches("button,input[type=button],input[type=submit],input[type=checkbox],input[type=radio]")||button.disabled)
+            throw new Error("เป้าหมายต้องเป็นปุ่มที่กดได้");
+          button.click();
+        }
+        let actual=read(test.expect);
+        if(actual!==test.expect.text||actual===previous){
+          await new Promise(resolve=>setTimeout(resolve,600));
+          actual=read(test.expect);
+        }
+        if(actual!==test.expect.text||actual===previous)
+          throw new Error("คาดว่า "+describe(test.expect.text)+" แต่ได้ "+describe(actual)+" หรือค่าไม่เปลี่ยน");
+        passed++;
+      }catch(error){record("ทดสอบการโต้ตอบ "+(index+1)+": "+describe(error.message))}
+    }
+    return passed;
+  }
+  window.addEventListener("load",()=>setTimeout(async()=>{
     const text=(document.body?.innerText||"").trim().replace(/\s+/g," ");
     const elements=[...document.querySelectorAll("h1,h2,h3,button,input,select,textarea,a")];
     const outline=elements.slice(0,16).map(el=>el.localName+" "+(el.innerText||el.getAttribute("aria-label")||el.getAttribute("placeholder")||"").trim().slice(0,100));
@@ -1146,11 +1289,26 @@ function sitePreviewProbe(nonce){
       !(document.body&&getComputedStyle(document.body).backgroundImage.startsWith("url("))){
       record("เปิดแล้วไม่พบเนื้อหาหรือองค์ประกอบในหน้า");
     }
-    send({nonce,errors:[...errors],summary:[document.title,...outline,text.slice(0,350)].filter(Boolean).join(" | ")},"*");
-  },650),{once:true});
+    let scene="";
+    if(threeModule){
+      const loaded=performance.getEntriesByName(threeModule,"resource").length>0;
+      const draws=[...webglDraws].reduce((total,[canvas,count])=>{
+        if(!(canvas instanceof HTMLCanvasElement)||!canvas.isConnected)return total;
+        const rect=canvas.getBoundingClientRect();
+        return rect.width>0&&rect.height>0&&getComputedStyle(canvas).visibility==="visible"?total+count:total;
+      },0);
+      if(!loaded)record("ไม่พบการโหลดโมดูล Three.js ที่กำหนด");
+      if(!draws)record("ไม่พบการวาดฉาก WebGL ลงบน canvas ที่มองเห็น");
+      scene="Three.js "+(loaded?"โหลดแล้ว":"ไม่พบโมดูล")+" · WebGL draw calls "+draws;
+    }
+    const layout=city?checkCity():"";
+    const interactions=await checkInteractions();
+    send({nonce,errors:[...errors],interactions,summary:[document.title,scene,layout,...outline,text.slice(0,350)].filter(Boolean).join(" | ")},"*");
+  },threeModule?1500:650),{once:true});
 }
-function previewSite(code,files,signal){
+function previewSite(code,files,signal,threeMode="",needsInteraction=false){
   signal?.throwIfAborted();
+  const threeModule=threeMode||code.includes(SITE_THREE_MODULE)?SITE_THREE_MODULE:"";
   const nonce=Array.from(crypto.getRandomValues(new Uint32Array(4))).join("-");
   const assets=new Map(files.map(file=>[file.name,"data:image/jpeg;base64,"+file.data]));
   const markup=code.replace(SITE_ASSET_RE,(match,attribute,css)=>{
@@ -1158,10 +1316,11 @@ function previewSite(code,files,signal){
     const name=ref.replace(/^\.\//,"").split(/[?#]/,1)[0];
     return assets.has(name)?match.replace(ref,()=>assets.get(name)):match;
   });
-  const policy="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+  const policy="default-src 'none'; script-src 'unsafe-inline'"
+    +(threeModule?" "+SITE_THREE_MODULE+" "+SITE_THREE_CORE:"")+"; style-src 'unsafe-inline'; "
     +"img-src data: blob:; font-src data:; media-src data: blob:; base-uri 'none'; form-action 'none'";
   const setup='<meta http-equiv="Content-Security-Policy" content="'+policy+'">'
-    +"<script>("+sitePreviewProbe.toString()+")("+JSON.stringify(nonce)+")<"+"/script>";
+    +"<script>("+sitePreviewProbe.toString()+")("+[nonce,threeModule,threeMode==="city",needsInteraction].map(JSON.stringify).join(",")+")<"+"/script>";
   const prefix=markup.match(/^\s*(?:<!doctype\s+html[^>]*>\s*)?(?:<html(?:\s[^>]*)?>\s*)?(?:<head(?:\s[^>]*)?>)?/i)[0];
   const frame=document.createElement("iframe");
   frame.setAttribute("sandbox","allow-scripts");
@@ -1183,7 +1342,8 @@ function previewSite(code,files,signal){
         finish(event.data);
     }
     function abort(){cleanup();reject(signal.reason)}
-    const timer=setTimeout(()=>finish({errors:["หน้าเว็บโหลดไม่เสร็จภายในเวลาตรวจ"],summary:""}),6000);
+    const inspectionTime=threeModule||needsInteraction||code.includes("site-smoke-tests")?12000:6000;
+    const timer=setTimeout(()=>finish({errors:["หน้าเว็บโหลดไม่เสร็จภายในเวลาตรวจ"],summary:""}),inspectionTime);
     window.addEventListener("message",receive);
     signal?.addEventListener("abort",abort,{once:true});
     document.body.appendChild(frame);
@@ -1194,39 +1354,114 @@ function siteNote(anchor,message){
   note.className="note";note.textContent=message;anchor.after(note);
   return note;
 }
-async function checkChatSites(reply,truncated,assets,signal){
-  const failed=[];
-  let count=0;
+async function checkChatSites(reply,truncated,assets,signal,threeMode,needsInteraction){
+  const reports=[];
   for(const pre of reply.querySelectorAll("pre")){
     const code=pre.querySelector("code")?.textContent||"";
     if(!isSiteDocument(code))continue;
-    count++;
+    if(threeMode)pre.dataset.threeMode=threeMode;
+    if(needsInteraction)pre.dataset.interactionRequired="true";
     const button=pre.querySelector(".site-btn");
     if(button)button.disabled=true;
     const note=siteNote(pre,"กำลังเปิดและตรวจหน้าเว็บในเบราว์เซอร์…");
     try{
       const files=collectSiteFiles(code,assets);
-      const result=truncated?{errors:["คำตอบถูกตัดก่อนเขียน HTML จบ"],summary:""}:await previewSite(code,files,signal);
+      const incomplete=truncated||(threeMode&&!/<\/html>\s*$/i.test(code));
+      const result=incomplete?{errors:["HTML ยังเขียนไม่จบ ต้องส่งฉบับเต็มถึง </html>"],summary:""}
+        :await previewSite(code,files,signal,threeMode,needsInteraction);
+      const report={...result,language:"html",filename:pre.dataset.file,status:result.errors.length?"fail":"pass"};
+      reports.push(report);
       if(result.errors.length){
         note.textContent="ตรวจพบปัญหา · "+result.errors.join(" · ");
-        failed.push(result);
       }else{
-        note.textContent="ตรวจการโหลดหน้าเว็บแล้ว";
-        const url=await publishSiteFromPre(pre,false,files,signal);
-        if(!url)note.textContent="ตรวจการโหลดผ่าน แต่ยังสร้างลิงก์ไม่ได้";
+        note.textContent=threeMode?"ตรวจฉาก 3 มิติแล้ว · "+result.summary:"ตรวจการโหลดหน้าเว็บแล้ว";
+        if(result.interactions)note.textContent+=" · ผ่านการโต้ตอบ "+result.interactions+" กรณี";
+        report.publish=async()=>{
+          const url=await publishSiteFromPre(pre,false,files,signal);
+          if(!url)note.textContent="ตรวจการโหลดผ่าน แต่ยังสร้างลิงก์ไม่ได้";
+        };
       }
     }finally{if(button)button.disabled=false}
   }
-  return {failed,count};
+  return reports;
 }
-function siteRepairPrompt(failed){
+function sourceCheckNote(pre){
+  if(!pre._sourceCheckNote)pre._sourceCheckNote=siteNote(pre,"");
+  return pre._sourceCheckNote;
+}
+async function checkSourceArtifacts(blocks,truncated,signal){
+  const queued=[],reports=[];
+  const encoder=new TextEncoder();
+  function complete(check,result){
+    const {pre,language,filename}=check;
+    const location=result.line?"บรรทัด "+result.line+(result.column?" คอลัมน์ "+result.column:"")+" · ":"";
+    const message=location+(result.message||"");
+    const label=filename||language;
+    sourceCheckNote(pre).textContent=result.status==="pass"?"ผ่านการตรวจไวยากรณ์ "+label:
+      (result.status==="fail"?"ไวยากรณ์ไม่ผ่าน ":"ยังตรวจไม่ได้ ")+label+" · "+message;
+    reports.push({language,filename,status:result.status,errors:[message]});
+  }
+  for(const pre of blocks){
+    const label=pre.dataset.language;
+    if(!label||isSiteDocument(pre.querySelector("code")?.textContent||""))continue;
+    const language=CODE_LANGUAGES.get(label);
+    if(!language){
+      if(!/^(html|text|txt|plain|log|output|markdown|md)$/.test(label))
+        sourceCheckNote(pre).textContent="ยังไม่มีตัวตรวจอัตโนมัติสำหรับ "+label;
+      continue;
+    }
+    const source=pre.querySelector("code")?.textContent||"";
+    const check={pre,language,source,filename:pre.dataset.file};
+    if(truncated||pre.dataset.closed==="false"){
+      complete(check,{status:"fail",message:"บล็อกโค้ดยังไม่จบ"});
+    }else if(encoder.encode(source).length>64*1024){
+      complete(check,{status:"unavailable",message:"โค้ดยาวเกิน 64 KB"});
+    }else{
+      sourceCheckNote(pre).textContent="กำลังตรวจไวยากรณ์…";
+      queued.push(check);
+    }
+  }
+  for(let i=0;i<queued.length;i+=2){
+    const group=queued.slice(i,i+2);
+    try{
+      const data=await jsonResponse(await authFetch("/api/code/check",{method:"POST",signal,
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({blocks:group.map(({language,source})=>({language,source}))})}));
+      group.forEach((check,index)=>complete(check,data.results[index]||{status:"unavailable",message:"ไม่มีผลตรวจ"}));
+    }catch(error){
+      if(error.name==="AbortError")throw error;
+      group.forEach(check=>complete(check,{status:"unavailable",message:error.message}));
+    }
+  }
+  return reports;
+}
+async function checkChatArtifacts(reply,truncated,assets,signal,threeMode,needsInteraction){
+  const sources=await checkSourceArtifacts(reply.querySelectorAll("pre"),truncated,signal);
+  const pages=await checkChatSites(reply,truncated,assets,signal,threeMode,needsInteraction);
+  return [...sources,...pages];
+}
+function pendingArtifactRepairs(previous,checked){
+  const unmatched=[...checked];
+  const missing=previous.filter(report=>{
+    const index=unmatched.findIndex(candidate=>candidate.language===report.language&&
+      (!report.filename||candidate.filename===report.filename)&&candidate.status!=="unavailable");
+    if(index<0)return true;
+    unmatched.splice(index,1);
+    return false;
+  }).map(report=>({...report,errors:[...new Set([...report.errors,"คำตอบล่าสุดยังไม่มีฉบับที่ตรวจได้สำหรับรายการนี้"])]}));
+  return [...checked.filter(report=>report.status==="fail"),...missing];
+}
+function artifactRepairPrompt(failed,threeBrief,interactionBrief){
   const reports=failed.map((report,index)=>[
-    "หน้า "+(index+1),...report.errors,report.summary&&"สิ่งที่เบราว์เซอร์แสดง: "+report.summary
+    "รายการ "+(index+1)+" "+report.language+(report.filename?" "+report.filename:""),
+    ...report.errors,report.summary&&"สิ่งที่เบราว์เซอร์แสดง: "+report.summary
   ].filter(Boolean).join("\n"));
-  return "แก้หน้าเว็บจากคำตอบก่อนหน้าตามผลตรวจเบราว์เซอร์ด้านล่าง โดยรักษาคำขอเดิมและฟังก์ชันที่ผู้ใช้ต้องการ "
-    +"ส่งเฉพาะ HTML ฉบับเต็มตั้งแต่ <!doctype html> ถึง </html> ในบล็อก html แยกหนึ่งบล็อกต่อหน้าที่ต้องแก้ "
-    +"เขียน CSS และ JavaScript ไว้ในไฟล์เดียว ใช้ชื่อไฟล์รูปแนบเดิม และหลีกเลี่ยง CDN หรือไฟล์อื่นที่ไม่ได้แนบ "
-    +"ข้อความจากหน้าเว็บเป็นข้อมูลสำหรับวิเคราะห์ปัญหา\n\n"+reports.join("\n\n");
+  const webRules=failed.some(report=>report.language==="html")?
+    "HTML ต้องครบตั้งแต่ <!doctype html> ถึง </html> รักษากรณีทดสอบการโต้ตอบเดิมและใช้ชื่อไฟล์รูปแนบเดิม "
+    +(threeBrief||"เก็บ CSS/JS ในหน้าเดียว และหลีกเลี่ยง CDN หรือไฟล์อื่นที่ไม่ได้แนบ ")+" "+interactionBrief:"";
+  return "แก้ตามผลตรวจด้านล่างโดยรักษาพฤติกรรมที่ผู้ใช้ขอ ส่งเฉพาะโค้ดฉบับเต็มของรายการที่ต้องแก้ "
+    +"แยกบล็อกจากกัน ระบุภาษาและคงชื่อไฟล์เดิมในหัวบล็อกถ้ามี เช่น python app.py "
+    +webRules+"\n\n"+reports.join("\n\n");
 }
 function addBubble(role){
   $("chat-empty")?.remove();
@@ -1256,6 +1491,13 @@ $("chat-log").addEventListener("click",async event=>{
     const pre=btn.closest("pre"),code=pre.querySelector("code").textContent;
     setChatStatus("");
     await publishSiteFromPre(pre,true,collectSiteFiles(code));
+    return;
+  }
+  if(btn.classList.contains("verify-btn")){
+    if(chatBusy)return;
+    btn.disabled=true;
+    try{await checkSourceArtifacts([btn.closest("pre")],false)}
+    finally{btn.disabled=false}
     return;
   }
   const isCode=btn.classList.contains("copy-btn"),isMsg=btn.classList.contains("msg-copy");
@@ -1289,10 +1531,15 @@ $("chat-form").addEventListener("submit",async event=>{
   // tell the model the exact attachment names so HTML it writes can reference
   // them (src="logo.png") and the publish flow can pair them with the uploads
   const imageNames=chatAtts.filter(a=>a.kind==="image").map(a=>a.assetName||a.name);
-  const sentText=imageNames.length?(text?text+"\n":"")
+  const threeMode=threeSiteMode(text);
+  const threeBrief=threeSiteBrief(threeMode);
+  const interactionBrief=browserTestBrief(text,threeMode);
+  const webBrief=[threeBrief,interactionBrief].filter(Boolean).join(" ");
+  const attachmentText=imageNames.length?(text?text+"\n":"")
     +"(แนบรูป "+imageNames.length+" ไฟล์: "+imageNames.join(", ")
     +" — ถ้าเขียนหน้าเว็บ/HTML ให้แทรกรูปพวกนี้ด้วยชื่อไฟล์เดิมเป๊ะ ๆ เช่น <img src=\""
     +imageNames[0]+"\"> ห้ามเปลี่ยนชื่อ ห้ามใช้ placeholder หรือลิงก์อื่นแทนรูปที่แนบมา)":text;
+  const sentText=webBrief?attachmentText+"\n\nแนวทางสำหรับตัวตรวจหน้าเว็บ: "+webBrief:attachmentText;
   const bubble=addBubble("user");
   bubble.textContent=text||"(ดูไฟล์แนบ)";
   for(const att of chatAtts){
@@ -1304,31 +1551,37 @@ $("chat-form").addEventListener("submit",async event=>{
   chatBusy=true;$("chat-send").disabled=true;$("chat-send").style.display="none";$("chat-stop").style.display="inline-block";
   chatAbort=new AbortController();
   const signal=chatAbort.signal;
+  const repairSource=asksToWriteCode(text)&&!/(จงใจให้ผิด|ตัวอย่างโค้ดที่ผิด|intentionally (?:broken|invalid))/i.test(text);
   try{
     let reply=addBubble("assistant");
     reply.innerHTML=web&&text?'🌐 กำลังค้นเว็บและอ่านหน้าเว็บ… <span class="cursor"></span>':'<span class="cursor"></span>';
     let result=await streamChatReply(reply,model,{role:"user",content:sentText,images,docs},text||"(ดูไฟล์แนบ)",{rag,web},signal);
     if(!result)return;
-    let {failed}=await checkChatSites(reply,result.truncated,assets,signal);
+    const firstCheck=await checkChatArtifacts(reply,result.truncated,assets,signal,threeMode,Boolean(interactionBrief));
+    let failed=firstCheck.filter(report=>report.status==="fail"&&(report.language==="html"||repairSource));
+    if(webBrief&&!firstCheck.some(report=>report.language==="html"))
+      failed.push({language:"html",errors:["คำตอบไม่มีโค้ด HTML ฉบับเต็มสำหรับเปิดตรวจ"],summary:""});
+    const pagesToPublish=firstCheck.filter(report=>report.publish);
     for(let attempt=1;failed.length&&attempt<=SITE_REPAIR_LIMIT;attempt++){
       signal.throwIfAborted();
-      const label="AI กำลังแก้หน้าเว็บตามผลตรวจ (รอบ "+attempt+"/"+SITE_REPAIR_LIMIT+")";
+      const label="AI กำลังแก้โค้ดตามผลตรวจ (รอบ "+attempt+"/"+SITE_REPAIR_LIMIT+")";
       reply=addBubble("assistant");
       reply.textContent=label+"…";
-      const content=siteRepairPrompt(failed);
+      const content=artifactRepairPrompt(failed,threeBrief,interactionBrief);
       result=await streamChatReply(reply,model,{role:"user",content},label,{},signal);
-      if(!result){siteNote(reply,"ยังแก้หน้าเว็บไม่สำเร็จ");return}
-      const checked=await checkChatSites(reply,result.truncated,assets,signal);
-      const missing=failed.slice(checked.count).map(report=>({
-        errors:[...new Set([...report.errors,"คำตอบรอบล่าสุดส่ง HTML ฉบับเต็มมาไม่ครบ"])],
-        summary:report.summary
-      }));
-      failed=[...checked.failed,...missing];
+      if(!result){siteNote(reply,"ยังแก้โค้ดไม่สำเร็จ");return}
+      const checked=await checkChatArtifacts(reply,result.truncated,assets,signal,threeMode,Boolean(interactionBrief));
+      pagesToPublish.push(...checked.filter(report=>report.publish));
+      failed=pendingArtifactRepairs(failed,checked.filter(report=>report.language==="html"||repairSource));
     }
-    if(failed.length)siteNote(reply,"ยังสร้างลิงก์สำหรับหน้าที่ตรวจไม่ผ่าน ลองขอให้ AI แก้ต่อจากผลตรวจในแชต");
+    if(failed.length){
+      siteNote(reply,"ยังมีโค้ดที่ตรวจไม่ผ่าน ลองขอให้ AI แก้ต่อจากผลตรวจในแชต");
+    }else{
+      for(const page of pagesToPublish){signal.throwIfAborted();await page.publish()}
+    }
   }catch(error){
-    if(error.name==="AbortError")setChatStatus("หยุดตรวจหน้าเว็บตามที่สั่ง");
-    else setChatStatus("ตรวจหน้าเว็บไม่สำเร็จ: "+error.message,true);
+    if(error.name==="AbortError")setChatStatus("หยุดตรวจโค้ดตามที่สั่ง");
+    else setChatStatus("ตรวจโค้ดไม่สำเร็จ: "+error.message,true);
   }finally{
     chatAbort=null;chatBusy=false;$("chat-send").disabled=false;$("chat-send").style.display="";$("chat-stop").style.display="none";
     $("chat-log").scrollTop=$("chat-log").scrollHeight;

@@ -20,6 +20,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -34,6 +35,81 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+CODE_CHECK_LANGUAGES = {"python", "javascript", "cjs", "json", "bash", "sh"}
+CODE_CHECK_MAX_BLOCKS = 8
+CODE_CHECK_MAX_SOURCE = 64 * 1024
+CODE_CHECK_SLOTS = threading.BoundedSemaphore(2)
+PYTHON_SYNTAX_CHECK = """
+import json
+import sys
+
+try:
+    compile(sys.stdin.buffer.read().decode("utf-8"), "<snippet>", "exec", dont_inherit=True)
+except SyntaxError as error:
+    print(json.dumps({"status": "fail", "message": error.msg[:240],
+                      "line": error.lineno, "column": error.offset}))
+except (ValueError, RecursionError, OverflowError):
+    print(json.dumps({"status": "unavailable", "message": "Python parser limit exceeded"}))
+else:
+    print('{"status": "pass"}')
+"""
+
+
+def reject_json_constant(value):
+    raise ValueError(f"JSON ไม่รองรับค่า {value}")
+
+
+def check_code_syntax(language, source):
+    """Parse generated source as data. Never import or run the snippet."""
+    if language == "json":
+        try:
+            json.loads(source, parse_constant=reject_json_constant)
+        except json.JSONDecodeError as error:
+            return {"status": "fail", "message": error.msg, "line": error.lineno,
+                    "column": error.colno}
+        except ValueError as error:
+            return {"status": "fail", "message": str(error)[:240]}
+        except RecursionError:
+            return {"status": "unavailable", "message": "JSON ซ้อนกันลึกเกินขอบเขตการตรวจ"}
+        return {"status": "pass"}
+    if language == "python":
+        command = [sys.executable, "-I", "-S", "-B", "-c", PYTHON_SYNTAX_CHECK]
+    elif language in ("javascript", "cjs"):
+        node = shutil.which("node")
+        if not node:
+            return {"status": "unavailable", "message": "เซิร์ฟเวอร์ไม่มี Node.js สำหรับตรวจไวยากรณ์"}
+        mode = "commonjs" if language == "cjs" else "module"
+        command = [node, "--check", f"--input-type={mode}", "-"]
+    else:
+        shell = shutil.which(language) if os.name == "posix" else None
+        if not shell:
+            return {"status": "unavailable", "message": f"เซิร์ฟเวอร์ไม่มี {language} สำหรับตรวจไวยากรณ์"}
+        command = [shell, "-n", "-s"]
+    env = {name: os.environ[name] for name in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+           if name in os.environ}
+    try:
+        result = subprocess.run(command, input=source.encode("utf-8"),
+                                capture_output=True, timeout=2, env=env)
+        if language == "python" and not result.returncode:
+            return json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return {"status": "unavailable", "message": "ตัวตรวจไวยากรณ์ทำงานไม่สำเร็จ"}
+    if not result.returncode:
+        return {"status": "pass"}
+    diagnostic = result.stderr.decode("utf-8", "replace")
+    if language in ("javascript", "cjs"):
+        line = re.search(r"^\[stdin\]:(\d+)", diagnostic, re.M)
+        error = re.search(r"^SyntaxError: ([^\n\r]+)", diagnostic, re.M)
+        if error:
+            return {"status": "fail", "message": error[1][:240],
+                    "line": int(line[1]) if line else None}
+    elif language in ("bash", "sh"):
+        error = re.search(r"(?:line (\d+)|(\d+)): ([Ss]yntax error[^\n\r]*)", diagnostic)
+        if error:
+            return {"status": "fail", "message": error[3][:240],
+                    "line": int(error[1] or error[2])}
+    return {"status": "unavailable", "message": "ตัวตรวจไวยากรณ์ทำงานไม่สำเร็จ"}
 
 COMFY = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
 COMFY_HOME = Path(os.environ.get("COMFY_HOME", str(Path.home() / "ComfyUI")))
@@ -2678,6 +2754,42 @@ class Handler(BaseHTTPRequestHandler):
                          "url": site["url"], "bytes": site["bytes"],
                          "storage": storage_summary(user["id"])})
 
+    def _handle_code_check(self):
+        body = self._read_json(1024 * 1024)
+        if body is None:
+            return
+        blocks = body.get("blocks")
+        if not isinstance(blocks, list) or not 1 <= len(blocks) <= CODE_CHECK_MAX_BLOCKS:
+            self._send(400, {"error": "ส่งโค้ดได้ครั้งละ 1–8 บล็อก"})
+            return
+        sources = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                self._send(400, {"error": "ข้อมูลบล็อกโค้ดไม่ถูกต้อง"})
+                return
+            language, source = block.get("language"), block.get("source")
+            if not isinstance(language, str) or language not in CODE_CHECK_LANGUAGES \
+                    or not isinstance(source, str):
+                self._send(400, {"error": "ภาษาโค้ดหรือข้อมูลบล็อกไม่ถูกต้อง"})
+                return
+            try:
+                size = len(source.encode("utf-8"))
+            except UnicodeEncodeError:
+                self._send(400, {"error": "โค้ดต้องเป็น UTF-8 ที่ถูกต้อง"})
+                return
+            if size > CODE_CHECK_MAX_SOURCE:
+                self._send(400, {"error": "โค้ดแต่ละบล็อกต้องมีขนาดไม่เกิน 64 KB"})
+                return
+            sources.append((language, source))
+        if not CODE_CHECK_SLOTS.acquire(blocking=False):
+            self._send(503, {"error": "ตัวตรวจโค้ดกำลังทำงานเต็มจำนวน ลองตรวจอีกครั้ง"})
+            return
+        try:
+            results = [check_code_syntax(language, source) for language, source in sources]
+        finally:
+            CODE_CHECK_SLOTS.release()
+        self._send(200, {"results": results})
+
     def do_POST(self):
         route = self.path.split("?", 1)[0]
         if route == "/api/login":
@@ -2715,6 +2827,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/api/sites":
             self._handle_site_create()
+            return
+        if route == "/api/code/check":
+            self._handle_code_check()
             return
         if route != "/api/generate":
             self._send(404, {"error": "not found"})

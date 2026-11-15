@@ -1886,6 +1886,48 @@ class LoginFlowTest(unittest.TestCase):
         error.exception.close()
 
 
+class CodeCheckHttpTest(ChatServerTest):
+    def check(self, blocks):
+        with post_json(self.base, "/api/code/check", {"blocks": blocks},
+                       token=self.auth["Authorization"][7:]) as response:
+            return json.load(response)["results"]
+
+    def test_returns_ordered_syntax_results_without_running_code(self):
+        valid, invalid, valid_json, invalid_json = self.check([
+            {"language": "python", "source": "raise RuntimeError('must never execute')"},
+            {"language": "python", "source": "def valid_name():\n    return ("},
+            {"language": "json", "source": '{"enabled": true}'},
+            {"language": "json", "source": '{"items": [NaN]}'},
+        ])
+        self.assertEqual(valid["status"], "pass")
+        self.assertEqual((invalid["status"], invalid["line"]), ("fail", 2))
+        self.assertEqual(valid_json["status"], "pass")
+        self.assertEqual(invalid_json["status"], "fail")
+
+    @unittest.skipUnless(draw_server.shutil.which("node"), "Node.js required")
+    def test_javascript_module_syntax_is_checked_without_running_code(self):
+        valid, invalid = self.check([
+            {"language": "javascript", "source": "export const count = 1; throw Error('never run');"},
+            {"language": "javascript", "source": "export const count = ;"},
+        ])
+        self.assertEqual(valid["status"], "pass")
+        self.assertEqual(invalid["status"], "fail")
+
+    def test_requires_login_and_rejects_unsupported_or_oversized_input(self):
+        good = {"blocks": [{"language": "python", "source": "pass"}]}
+        too_large = {"blocks": [{"language": "python", "source": " " * 65537}]}
+        bad_language = {"blocks": [{"language": "unsupported", "source": "pass"}]}
+        for body, token, status in (
+            (good, None, 401),
+            (too_large, self.auth["Authorization"][7:], 400),
+            (bad_language, self.auth["Authorization"][7:], 400),
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                post_json(self.base, "/api/code/check", body, token=token)
+            self.assertEqual(caught.exception.code, status)
+            caught.exception.close()
+
+
 class SiteHttpTest(ChatServerTest):
     """Published chat pages: POST /api/sites + public GET /s/<id>/<key>/."""
 
